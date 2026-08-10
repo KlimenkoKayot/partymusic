@@ -77,7 +77,11 @@ export default function App() {
 
   // Apply the authoritative playback state to the local <audio> element.
   const applyState = useCallback((state) => {
-    lastState.current = state
+    // Capture a *client-local* reference timestamp. All forward projection is
+    // done relative to this instead of the server's `updatedAt`, so clock skew
+    // between the browser and the server can never leak into playback position.
+    const receivedAt = Date.now()
+    lastState.current = { ...state, receivedAt }
     const audio = audioRef.current
     applyingRemote.current = true
 
@@ -94,10 +98,15 @@ export default function App() {
     setTimeout(
       () => {
         if (!audio) return
-        const drift = Math.abs(audio.currentTime - state.position)
+        // Project the target forward by however long we waited so every client
+        // lands on the same spot regardless of message/processing latency.
+        const target = state.playing
+          ? state.position + (Date.now() - receivedAt) / 1000
+          : state.position
+        const drift = Math.abs(audio.currentTime - target)
         if (drift > SYNC_THRESHOLD || Number.isNaN(audio.currentTime) || trackChanged) {
           try {
-            audio.currentTime = state.position
+            audio.currentTime = target
           } catch (e) {
             /* seeking before metadata is ready — ignored */
           }
@@ -124,11 +133,11 @@ export default function App() {
       .then((d) => setYandexEnabled(!!d.yandex))
       .catch(() => {})
 
-    fetch('/api/tracks')
-      .then((r) => r.json())
-      .then((data) => setTracks(data || []))
-      .catch(() => {})
-
+    // NOTE: we intentionally do NOT fetch('/api/tracks') here. That REST
+    // endpoint only returns local files and would race with (and clobber) the
+    // authoritative room queue that the server pushes over the WebSocket on
+    // connect — which includes Yandex tracks added by others. The `playlist`
+    // WS message is the single source of truth for the queue.
     connect(roomName, userName)
   }
 
@@ -146,9 +155,12 @@ export default function App() {
       const audio = audioRef.current
       const s = lastState.current
       if (!audio || !s.playing || applyingRemote.current) return
-      // Project the last known server position forward.
+      // Project the last known position forward using our *client-local*
+      // receipt time. Using the server's `updatedAt` here would fold clock
+      // skew between browser and server into the target, making clients drift
+      // apart instead of together.
       const expected =
-        s.position + (Date.now() - (s.updatedAt || Date.now())) / 1000
+        s.position + (Date.now() - (s.receivedAt || Date.now())) / 1000
       const drift = audio.currentTime - expected
       if (Math.abs(drift) > SYNC_THRESHOLD) {
         try {
