@@ -22,6 +22,7 @@ export default function Player({
 
   // Keep the local progress bar updated.
   useEffect(() => {
+    //игнат настюшкин
     const audio = audioRef.current
     if (!audio) return
     const onTime = () => setCurrent(audio.currentTime)
@@ -43,6 +44,10 @@ export default function Player({
   }
   const handlePause = () => {
     if (applyingRemote.current) return
+    // The browser fires a native "pause" right before "ended" when a track
+    // finishes. Forwarding it would pause the whole room just as the server
+    // is about to auto-advance to the next track.
+    if (audioRef.current && audioRef.current.ended) return
     onPause()
   }
 

@@ -30,6 +30,9 @@ export default function App() {
   const applyingRemote = useRef(false)
   // Latest authoritative state, used by the drift corrector.
   const lastState = useRef({ trackIndex: -1, position: 0, playing: false })
+  // Mirrors `trackIndex` for stable callbacks (the WS onmessage closure holds
+  // the first render's applyState, so reading React state there is stale).
+  const trackIndexRef = useRef(-1)
 
   // ----- WebSocket connection -------------------------------------------
   const connect = useCallback((roomName, userName) => {
@@ -85,13 +88,31 @@ export default function App() {
     const audio = audioRef.current
     applyingRemote.current = true
 
-    const trackChanged = state.trackIndex !== trackIndex
+    // Compare against a ref, not React state: this callback is held by the
+    // WebSocket onmessage closure, so state read here would always be the
+    // first render's value (-1). That misreported *every* update as a track
+    // change and forced a hard seek on each periodic sync, making playback
+    // stutter and jump.
+    const trackChanged = state.trackIndex !== trackIndexRef.current
+    trackIndexRef.current = state.trackIndex
     setTrackIndex(state.trackIndex)
     setPlaying(state.playing)
 
     if (!audio) {
       applyingRemote.current = false
       return
+    }
+
+    // Native play/pause events are dispatched *asynchronously* after calling
+    // play()/pause(). If the guard drops immediately, those events look like
+    // user actions and get echoed back to the server with this client's local
+    // position — every client then ping-pongs its own position into the room
+    // and playback never settles. Keep the guard up until the events have
+    // had time to fire.
+    const releaseGuard = () => {
+      setTimeout(() => {
+        applyingRemote.current = false
+      }, 250)
     }
 
     // Wait a tick so React swaps the <source> if the track changed.
@@ -112,15 +133,18 @@ export default function App() {
           }
         }
         if (state.playing) {
-          audio.play().catch(() => {})
+          audio
+            .play()
+            .catch(() => {})
+            .finally(releaseGuard)
         } else {
           audio.pause()
+          releaseGuard()
         }
-        applyingRemote.current = false
       },
       trackChanged ? 120 : 40
     )
-  }, [trackIndex])
+  }, [])
 
   // ----- Load track list + initial connection ---------------------------
   const doJoin = (roomName, userName) => {
