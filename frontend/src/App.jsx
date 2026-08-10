@@ -27,6 +27,9 @@ export default function App() {
   // everyone else follows the leader's audio clock.
   const [isLeader, setIsLeader] = useState(false)
   const isLeaderRef = useRef(false)
+  // Browsers block audio.play() without a user gesture. When that happens on
+  // a follower we must surface a button so the user can unlock audio.
+  const [needsGesture, setNeedsGesture] = useState(false)
 
   const wsRef = useRef(null)
   const audioRef = useRef(null)
@@ -149,7 +152,11 @@ export default function App() {
         if (state.playing) {
           audio
             .play()
-            .catch(() => {})
+            .then(
+              () => setNeedsGesture(false),
+              // NotAllowedError => autoplay blocked, user gesture required.
+              () => setNeedsGesture(true)
+            )
             .finally(releaseGuard)
         } else {
           audio.pause()
@@ -203,6 +210,32 @@ export default function App() {
     return () => clearInterval(id)
   }, [joined, isLeader, send])
 
+  // Unlock audio with a real user gesture (autoplay policy), then jump to
+  // the projected authoritative position so we come in already in sync.
+  const enableAudio = () => {
+    const audio = audioRef.current
+    if (!audio) return
+    const s = lastState.current
+    applyingRemote.current = true
+    const expected = s.playing
+      ? s.position + (Date.now() - (s.receivedAt || Date.now())) / 1000
+      : s.position
+    try {
+      audio.currentTime = expected
+    } catch (e) {
+      /* metadata not ready — the next leader_pos will correct us */
+    }
+    audio
+      .play()
+      .then(() => setNeedsGesture(false))
+      .catch(() => {})
+      .finally(() => {
+        setTimeout(() => {
+          applyingRemote.current = false
+        }, 250)
+      })
+  }
+
   // ----- User actions (broadcast to the room) ---------------------------
   // Playback control is leader-only; the server ignores it from followers.
   const onPlay = () => send('play', { position: audioRef.current?.currentTime || 0 })
@@ -235,6 +268,13 @@ export default function App() {
 
       <div className="layout">
         <main className="main">
+          {needsGesture && playing && (
+            <div className="player" style={{ textAlign: 'center' }}>
+              <button className="play-btn" onClick={enableAudio}>
+                🔊 Включить звук (браузер заблокировал автовоспроизведение)
+              </button>
+            </div>
+          )}
           <Player
             audioRef={audioRef}
             track={currentTrack}
