@@ -40,6 +40,11 @@ export default function App() {
   // Mirrors `trackIndex` for stable callbacks (the WS onmessage closure holds
   // the first render's applyState, so reading React state there is stale).
   const trackIndexRef = useRef(-1)
+  // Smoothed WebSocket round-trip time to the server (ms). Half of it is the
+  // one-way network latency we must compensate for: the leader's report is
+  // already rtt/2 old when the server stamps it, and the server's state is
+  // another rtt/2 old by the time a follower receives it.
+  const rttRef = useRef(0)
 
   // ----- WebSocket connection -------------------------------------------
   const connect = useCallback((roomName, userName) => {
@@ -68,6 +73,16 @@ export default function App() {
   // ----- Incoming server messages ---------------------------------------
   const handleMessage = useCallback((msg) => {
     switch (msg.type) {
+      case 'pong': {
+        // The server echoed our timestamp back — the elapsed time is one
+        // full round trip. Smooth with an EMA so a single congested packet
+        // doesn't yank the sync target around.
+        const sample = Date.now() - (msg.data && msg.data.t ? msg.data.t : Date.now())
+        rttRef.current = rttRef.current
+          ? rttRef.current * 0.8 + sample * 0.2
+          : sample
+        break
+      }
       case 'playlist':
         setTracks(msg.data || [])
         break
@@ -130,10 +145,13 @@ export default function App() {
     setTimeout(
       () => {
         if (!audio) return
-        // Project the target forward by however long we waited so every client
-        // lands on the same spot regardless of message/processing latency.
+        // Project the target forward by:
+        //  - how long the state message spent in flight (one-way ≈ rtt/2),
+        //  - plus however long we waited locally before applying it,
+        // so every client lands on the same spot regardless of its ping.
+        const oneWay = rttRef.current / 2 / 1000
         const target = state.playing
-          ? state.position + (Date.now() - receivedAt) / 1000
+          ? state.position + oneWay + (Date.now() - receivedAt) / 1000
           : state.position
         const drift = Math.abs(audio.currentTime - target)
         // The leader never seeks to broadcast state (it originated from the
@@ -186,17 +204,29 @@ export default function App() {
     connect(roomName, userName)
   }
 
+  // Measure ping to the server continuously (leader and followers alike).
+  useEffect(() => {
+    if (!joined) return
+    send('ping', { t: Date.now() })
+    const id = setInterval(() => send('ping', { t: Date.now() }), 2000)
+    return () => clearInterval(id)
+  }, [joined, send])
+
   // Leader: push the real <audio> clock to the server every second. The
   // server rebroadcasts it to followers, so everyone tracks the leader's
   // actual playback (buffering stalls included) instead of wall-clock math.
+  // The reported position is advanced by the leader's half-RTT so it is
+  // accurate *at the moment the server receives it*, not when it was sent.
   useEffect(() => {
     if (!joined || !isLeader) return
     const id = setInterval(() => {
       const audio = audioRef.current
       if (!audio || applyingRemote.current) return
+      const playingNow = !audio.paused && !audio.ended
+      const oneWay = rttRef.current / 2 / 1000
       send('leader_pos', {
-        position: audio.currentTime || 0,
-        playing: !audio.paused && !audio.ended,
+        position: (audio.currentTime || 0) + (playingNow ? oneWay : 0),
+        playing: playingNow,
       })
     }, 1000)
     return () => clearInterval(id)
@@ -218,7 +248,9 @@ export default function App() {
     const s = lastState.current
     applyingRemote.current = true
     const expected = s.playing
-      ? s.position + (Date.now() - (s.receivedAt || Date.now())) / 1000
+      ? s.position +
+        rttRef.current / 2 / 1000 +
+        (Date.now() - (s.receivedAt || Date.now())) / 1000
       : s.position
     try {
       audio.currentTime = expected

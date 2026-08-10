@@ -59,6 +59,16 @@ func (c *Client) readPump() {
 			log.Printf("bad message from %s: %v", c.name, err)
 			continue
 		}
+		// RTT probe: answer immediately from the read loop, bypassing the
+		// room's serialized event loop, so queueing delay does not inflate
+		// the measured ping. The payload (client timestamp) is echoed as-is.
+		if msg.Type == "ping" {
+			select {
+			case c.send <- newMessage("pong", msg.Data):
+			default:
+			}
+			continue
+		}
 		c.room.broadcast <- inbound{client: c, msg: msg}
 	}
 }
