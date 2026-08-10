@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -23,6 +22,7 @@ var (
 	musicDir     = envOr("MUSIC_DIR", "./music")
 	yandexToken  = os.Getenv("YANDEX_MUSIC_TOKEN")
 	yandexClient *YandexClient
+	yandexCache  *audioCache
 )
 
 func envOr(key, def string) string {
@@ -131,6 +131,7 @@ func main() {
 	hub := NewHub()
 
 	yandexClient = NewYandexClient(yandexToken)
+	yandexCache = newAudioCache()
 	if yandexClient.enabled() {
 		log.Printf("Yandex Music search enabled")
 	} else {
@@ -177,8 +178,11 @@ func main() {
 		_ = json.NewEncoder(w).Encode(tracks)
 	})
 
-	// Audio proxy: /api/yandex/stream/<trackID> — resolves a signed URL and
-	// streams the bytes (with range support) so the token never hits the client.
+	// Audio proxy: /api/yandex/stream/<trackID> — downloads the track from
+	// Yandex exactly once into a local cache and then serves every client from
+	// that shared copy (with native HTTP range support). Yandex only allows one
+	// concurrent stream per account, so fetching per-client would let only a
+	// single device actually receive audio; caching removes that bottleneck.
 	mux.HandleFunc("/api/yandex/stream/", func(w http.ResponseWriter, r *http.Request) {
 		if !yandexClient.enabled() {
 			http.Error(w, "yandex music not configured", http.StatusServiceUnavailable)
@@ -189,13 +193,19 @@ func main() {
 			http.Error(w, "missing track id", http.StatusBadRequest)
 			return
 		}
-		streamURL, err := yandexClient.ResolveStreamURL(trackID)
+		path, err := yandexCache.get(trackID, func() (string, error) {
+			return yandexClient.ResolveStreamURL(trackID)
+		})
 		if err != nil {
-			log.Printf("resolve stream %s: %v", trackID, err)
+			log.Printf("cache stream %s: %v", trackID, err)
 			http.Error(w, "cannot resolve stream", http.StatusBadGateway)
 			return
 		}
-		proxyAudio(w, r, streamURL)
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Header().Set("Accept-Ranges", "bytes")
+		// http.ServeFile handles Range requests, conditional headers and lets
+		// multiple clients read the same file concurrently without contention.
+		http.ServeFile(w, r, path)
 	})
 
 	// WebSocket endpoint: /ws?room=<name>&name=<user>
@@ -225,41 +235,6 @@ func corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-// proxyAudio streams the remote audio bytes to the client, forwarding Range
-// headers so the browser can seek. The Yandex OAuth token is never exposed.
-func proxyAudio(w http.ResponseWriter, r *http.Request, streamURL string) {
-	req, err := http.NewRequest(http.MethodGet, streamURL, nil)
-	if err != nil {
-		http.Error(w, "bad upstream", http.StatusBadGateway)
-		return
-	}
-	if rng := r.Header.Get("Range"); rng != "" {
-		req.Header.Set("Range", rng)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		http.Error(w, "upstream error", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Pass through relevant headers.
-	for _, h := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"} {
-		if v := resp.Header.Get(h); v != "" {
-			w.Header().Set(h, v)
-		}
-	}
-	if w.Header().Get("Content-Type") == "" {
-		w.Header().Set("Content-Type", "audio/mpeg")
-	}
-	if w.Header().Get("Accept-Ranges") == "" {
-		w.Header().Set("Accept-Ranges", "bytes")
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
 }
 
 // ----------------------------------------------------------------------------
