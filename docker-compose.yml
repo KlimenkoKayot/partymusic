@@ -1,0 +1,23 @@
+services:
+  backend:
+    build: ./backend
+    container_name: partymusic-backend
+    environment:
+      - LISTEN_ADDR=:8080
+      - MUSIC_DIR=/app/music
+      # Personal Yandex Music OAuth token (see README for how to get it).
+      # Set it in a .env file next to this compose file: YANDEX_MUSIC_TOKEN=...
+      - YANDEX_MUSIC_TOKEN=${YANDEX_MUSIC_TOKEN:-}
+    volumes:
+      # Put your audio files (.mp3/.ogg/.wav/.flac/.m4a/.opus) into ./music
+      - ./music:/app/music:ro
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: partymusic-frontend
+    ports:
+      - "8000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
