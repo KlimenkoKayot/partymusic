@@ -134,6 +134,10 @@ func (r *Room) run() {
 // Playback control (play/pause/seek/select/ended) and position reports are
 // only honored when they come from the room leader — every other client is a
 // follower that merely mirrors the leader's clock.
+// prepareDelayMs is the delay before playback starts after a track change.
+// This gives all clients time to buffer the audio before synchronized playback begins.
+const prepareDelayMs = 2000
+
 func (r *Room) handleMessage(in inbound) {
 	switch in.msg.Type {
 	case "play":
@@ -174,45 +178,6 @@ func (r *Room) handleMessage(in inbound) {
 		r.state.UpdatedAt = time.Now().UnixMilli()
 		r.broadcastState()
 
-	case "leader_pos":
-		// Periodic ground-truth position report from the leader's <audio>
-		// clock. This is what keeps followers in sync with the actual
-		// playback rather than a wall-clock projection.
-		if in.client != r.leader {
-			return
-		}
-		var p struct {
-			Position float64 `json:"position"`
-			Playing  bool    `json:"playing"`
-			At       int64   `json:"at"` // leader's estimate of SERVER time at capture
-		}
-		_ = json.Unmarshal(in.msg.Data, &p)
-		r.state.Position = p.Position
-		r.state.Playing = p.Playing
-		// Anchor the sample at the moment the leader CAPTURED it (expressed
-		// on the server clock via the leader's NTP offset), not the moment it
-		// arrived here — that removes the leader's uplink latency from the
-		// shared timeline. Guard against garbage stamps.
-		now := time.Now().UnixMilli()
-		if p.At > 0 && p.At <= now && now-p.At < 5000 {
-			r.state.UpdatedAt = p.At
-		} else {
-			r.state.UpdatedAt = now
-		}
-		// Fan out to followers only — the leader IS the source of truth.
-		raw := r.stateMessage()
-		for c := range r.clients {
-			if c == r.leader {
-				continue
-			}
-			select {
-			case c.send <- raw:
-			default:
-				close(c.send)
-				delete(r.clients, c)
-			}
-		}
-
 	case "select":
 		if in.client != r.leader {
 			return
@@ -227,7 +192,9 @@ func (r *Room) handleMessage(in inbound) {
 		r.state.TrackIndex = p.TrackIndex
 		r.state.Position = 0
 		r.state.Playing = true
-		r.state.UpdatedAt = time.Now().UnixMilli()
+		// Set UpdatedAt to a future time so all clients have time to buffer
+		// before synchronized playback begins.
+		r.state.UpdatedAt = time.Now().UnixMilli() + prepareDelayMs
 		r.broadcastState()
 
 	case "add":
@@ -249,7 +216,9 @@ func (r *Room) handleMessage(in inbound) {
 			r.state.TrackIndex = len(r.playlist) - 1
 			r.state.Position = 0
 			r.state.Playing = true
-			r.state.UpdatedAt = time.Now().UnixMilli()
+			// Set UpdatedAt to a future time so all clients have time to buffer
+			// before synchronized playback begins.
+			r.state.UpdatedAt = time.Now().UnixMilli() + prepareDelayMs
 			r.broadcastState()
 		}
 
@@ -271,7 +240,9 @@ func (r *Room) handleMessage(in inbound) {
 		r.state.TrackIndex = next
 		r.state.Position = 0
 		r.state.Playing = true
-		r.state.UpdatedAt = time.Now().UnixMilli()
+		// Set UpdatedAt to a future time so all clients have time to buffer
+		// before synchronized playback begins.
+		r.state.UpdatedAt = time.Now().UnixMilli() + prepareDelayMs
 		r.broadcastState()
 
 	case "sync":

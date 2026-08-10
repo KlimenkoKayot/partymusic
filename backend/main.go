@@ -108,6 +108,9 @@ func (s PlaybackState) effectivePosition() float64 {
 		return s.Position
 	}
 	elapsed := float64(time.Now().UnixMilli()-s.UpdatedAt) / 1000.0
+	if elapsed < 0 {
+		return s.Position // prepare phase — playback hasn't started yet
+	}
 	return s.Position + elapsed
 }
 
