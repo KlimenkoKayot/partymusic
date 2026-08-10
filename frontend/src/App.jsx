@@ -6,8 +6,18 @@ import Users from './components/Users.jsx'
 import Chat from './components/Chat.jsx'
 import Search from './components/Search.jsx'
 
-// If the two players drift more than this many seconds, we hard-resync.
-const SYNC_THRESHOLD = 0.6
+// ---------------------------------------------------------------------------
+// Sync tuning
+// ---------------------------------------------------------------------------
+// Drift beyond this => hard seek (rare; e.g. after a buffering stall).
+const HARD_SEEK_THRESHOLD = 0.3
+// Drift below this is considered "in sync" — leave playbackRate at 1.
+const RATE_DEADBAND = 0.02
+// Maximum playback-rate deviation used for soft correction (±5% is inaudible
+// with pitch preservation and converges 0.3 s of drift in ~6 s).
+const MAX_RATE_ADJUST = 0.05
+// How often the drift corrector runs.
+const CORRECTOR_INTERVAL_MS = 250
 
 export default function App() {
   const [joined, setJoined] = useState(false)
@@ -35,16 +45,45 @@ export default function App() {
   const audioRef = useRef(null)
   // Guards to avoid echoing server-driven changes back to the server.
   const applyingRemote = useRef(false)
-  // Latest authoritative state, used by the drift corrector.
-  const lastState = useRef({ trackIndex: -1, position: 0, playing: false })
+  // Latest authoritative state; `updatedAt` is a SERVER-clock timestamp.
+  const lastState = useRef({ trackIndex: -1, position: 0, playing: false, updatedAt: 0 })
   // Mirrors `trackIndex` for stable callbacks (the WS onmessage closure holds
   // the first render's applyState, so reading React state there is stale).
   const trackIndexRef = useRef(-1)
-  // Smoothed WebSocket round-trip time to the server (ms). Half of it is the
-  // one-way network latency we must compensate for: the leader's report is
-  // already rtt/2 old when the server stamps it, and the server's state is
-  // another rtt/2 old by the time a follower receives it.
-  const rttRef = useRef(0)
+
+  // -------------------------------------------------------------------------
+  // Shared clock (NTP-style over the WebSocket)
+  // -------------------------------------------------------------------------
+  // Every client continuously estimates `serverTime - localTime`. All sync
+  // targets are computed on the SERVER clock, so two devices standing next to
+  // each other resolve the exact same target position at the same physical
+  // moment — regardless of how different their pings are.
+  const rttRef = useRef(0) // smoothed round-trip time, ms
+  const clockOffsetRef = useRef(0) // smoothed serverTime - localTime, ms
+  const clockReadyRef = useRef(false)
+
+  const serverNow = useCallback(() => Date.now() + clockOffsetRef.current, [])
+
+  const onPong = useCallback((data) => {
+    if (!data || !data.t || !data.serverTime) return
+    const now = Date.now()
+    const rtt = now - data.t
+    if (rtt < 0 || rtt > 10000) return // nonsense sample
+    // offset = server clock at the midpoint of the round trip minus our clock.
+    const offset = data.serverTime - (data.t + rtt / 2)
+    if (!clockReadyRef.current) {
+      rttRef.current = rtt
+      clockOffsetRef.current = offset
+      clockReadyRef.current = true
+      return
+    }
+    rttRef.current = rttRef.current * 0.8 + rtt * 0.2
+    // Only trust offset samples taken over a "clean" round trip: congested
+    // packets have asymmetric delays and would poison the clock estimate.
+    if (rtt <= rttRef.current * 1.5 + 5) {
+      clockOffsetRef.current = clockOffsetRef.current * 0.8 + offset * 0.2
+    }
+  }, [])
 
   // ----- WebSocket connection -------------------------------------------
   const connect = useCallback((roomName, userName) => {
@@ -73,16 +112,9 @@ export default function App() {
   // ----- Incoming server messages ---------------------------------------
   const handleMessage = useCallback((msg) => {
     switch (msg.type) {
-      case 'pong': {
-        // The server echoed our timestamp back — the elapsed time is one
-        // full round trip. Smooth with an EMA so a single congested packet
-        // doesn't yank the sync target around.
-        const sample = Date.now() - (msg.data && msg.data.t ? msg.data.t : Date.now())
-        rttRef.current = rttRef.current
-          ? rttRef.current * 0.8 + sample * 0.2
-          : sample
+      case 'pong':
+        onPong(msg.data)
         break
-      }
       case 'playlist':
         setTracks(msg.data || [])
         break
@@ -104,21 +136,24 @@ export default function App() {
     }
   }, [])
 
+  // Target position on the shared clock: where the room "should" be right now.
+  const targetPosition = useCallback(() => {
+    const s = lastState.current
+    if (!s.playing) return s.position
+    return s.position + (serverNow() - s.updatedAt) / 1000
+  }, [serverNow])
+
   // Apply the authoritative playback state to the local <audio> element.
+  // This only handles DISCRETE transitions (track change, play/pause). All
+  // positional alignment is done continuously by the drift corrector below —
+  // hard seeks from here would fight with it and cause audible jumps.
   const applyState = useCallback((state) => {
-    // Capture a *client-local* reference timestamp. All forward projection is
-    // done relative to this instead of the server's `updatedAt`, so clock skew
-    // between the browser and the server can never leak into playback position.
-    const receivedAt = Date.now()
-    lastState.current = { ...state, receivedAt }
+    lastState.current = { ...state }
     const audio = audioRef.current
     applyingRemote.current = true
 
     // Compare against a ref, not React state: this callback is held by the
-    // WebSocket onmessage closure, so state read here would always be the
-    // first render's value (-1). That misreported *every* update as a track
-    // change and forced a hard seek on each periodic sync, making playback
-    // stutter and jump.
+    // WebSocket onmessage closure, so state read here would always be stale.
     const trackChanged = state.trackIndex !== trackIndexRef.current
     trackIndexRef.current = state.trackIndex
     setTrackIndex(state.trackIndex)
@@ -131,10 +166,8 @@ export default function App() {
 
     // Native play/pause events are dispatched *asynchronously* after calling
     // play()/pause(). If the guard drops immediately, those events look like
-    // user actions and get echoed back to the server with this client's local
-    // position — every client then ping-pongs its own position into the room
-    // and playback never settles. Keep the guard up until the events have
-    // had time to fire.
+    // user actions and get echoed back to the server — every client then
+    // ping-pongs its own position into the room and playback never settles.
     const releaseGuard = () => {
       setTimeout(() => {
         applyingRemote.current = false
@@ -145,26 +178,12 @@ export default function App() {
     setTimeout(
       () => {
         if (!audio) return
-        // Project the target forward by:
-        //  - how long the state message spent in flight (one-way ≈ rtt/2),
-        //  - plus however long we waited locally before applying it,
-        // so every client lands on the same spot regardless of its ping.
-        const oneWay = rttRef.current / 2 / 1000
-        const target = state.playing
-          ? state.position + oneWay + (Date.now() - receivedAt) / 1000
-          : state.position
-        const drift = Math.abs(audio.currentTime - target)
-        // The leader never seeks to broadcast state (it originated from the
-        // leader's own clock — seeking to a reflection of yourself only adds
-        // jitter). Followers hard-seek on track change or noticeable drift.
-        const shouldSeek = isLeaderRef.current
-          ? trackChanged
-          : drift > SYNC_THRESHOLD || Number.isNaN(audio.currentTime) || trackChanged
-        if (shouldSeek) {
+        if (trackChanged || !state.playing) {
+          // Discrete jump: land straight on the shared-clock target.
           try {
-            audio.currentTime = target
+            audio.currentTime = Math.max(0, targetPosition())
           } catch (e) {
-            /* seeking before metadata is ready — ignored */
+            /* metadata not ready — corrector will fix it */
           }
         }
         if (state.playing) {
@@ -178,12 +197,13 @@ export default function App() {
             .finally(releaseGuard)
         } else {
           audio.pause()
+          audio.playbackRate = 1
           releaseGuard()
         }
       },
-      trackChanged ? 120 : 40
+      trackChanged ? 120 : 0
     )
-  }, [])
+  }, [targetPosition])
 
   // ----- Load track list + initial connection ---------------------------
   const doJoin = (roomName, userName) => {
@@ -204,58 +224,114 @@ export default function App() {
     connect(roomName, userName)
   }
 
-  // Measure ping to the server continuously (leader and followers alike).
+  // Clock sync: a burst on join to converge fast, then a steady trickle.
   useEffect(() => {
     if (!joined) return
-    send('ping', { t: Date.now() })
-    const id = setInterval(() => send('ping', { t: Date.now() }), 2000)
-    return () => clearInterval(id)
+    let n = 0
+    const burst = setInterval(() => {
+      send('ping', { t: Date.now() })
+      if (++n >= 8) clearInterval(burst)
+    }, 300)
+    const steady = setInterval(() => send('ping', { t: Date.now() }), 2000)
+    return () => {
+      clearInterval(burst)
+      clearInterval(steady)
+    }
   }, [joined, send])
 
-  // Leader: push the real <audio> clock to the server every second. The
-  // server rebroadcasts it to followers, so everyone tracks the leader's
-  // actual playback (buffering stalls included) instead of wall-clock math.
-  // The reported position is advanced by the leader's half-RTT so it is
-  // accurate *at the moment the server receives it*, not when it was sent.
+  // Leader: publish the real <audio> clock, stamped with SERVER time. The
+  // stamp makes the report self-describing — the server stores it as-is and
+  // followers project from it on the same shared clock, so neither the
+  // leader's ping nor the followers' ping can skew the target.
   useEffect(() => {
     if (!joined || !isLeader) return
     const id = setInterval(() => {
       const audio = audioRef.current
-      if (!audio || applyingRemote.current) return
+      if (!audio || applyingRemote.current || !clockReadyRef.current) return
       const playingNow = !audio.paused && !audio.ended
-      const oneWay = rttRef.current / 2 / 1000
       send('leader_pos', {
-        position: (audio.currentTime || 0) + (playingNow ? oneWay : 0),
+        position: audio.currentTime || 0,
         playing: playingNow,
+        at: serverNow(),
       })
-    }, 1000)
+    }, 500)
     return () => clearInterval(id)
-  }, [joined, isLeader, send])
+  }, [joined, isLeader, send, serverNow])
 
-  // Followers: periodically re-request the authoritative state as a fallback
-  // (e.g. if the leader's tab is throttled and leader_pos stops flowing).
+  // Followers: fallback state poll (e.g. leader's tab throttled in background).
   useEffect(() => {
     if (!joined || isLeader) return
     const id = setInterval(() => send('sync'), 5000)
     return () => clearInterval(id)
   }, [joined, isLeader, send])
 
+  // -------------------------------------------------------------------------
+  // Continuous drift corrector (followers only)
+  // -------------------------------------------------------------------------
+  // Compares the local audio clock against the shared-clock target several
+  // times per second and nudges `playbackRate` by up to ±5% — completely
+  // inaudible, but it keeps devices locked "sound to sound". A hard seek is
+  // used only for gross desync (buffer stall, tab wake-up).
+  useEffect(() => {
+    if (!joined || isLeader) return
+    const id = setInterval(() => {
+      const audio = audioRef.current
+      const s = lastState.current
+      if (!audio || !s.playing || audio.paused || applyingRemote.current) return
+      if (!clockReadyRef.current) return
+
+      const target = targetPosition()
+      const drift = audio.currentTime - target // >0 we're ahead, <0 behind
+
+      if (Math.abs(drift) > HARD_SEEK_THRESHOLD) {
+        try {
+          // Land slightly ahead of the target to absorb the seek latency.
+          audio.currentTime = target + 0.05
+          audio.playbackRate = 1
+        } catch (e) {
+          /* metadata not ready */
+        }
+        return
+      }
+
+      if (Math.abs(drift) < RATE_DEADBAND) {
+        if (audio.playbackRate !== 1) audio.playbackRate = 1
+        return
+      }
+
+      // Proportional controller: correction strength scales with drift.
+      const adjust = Math.max(
+        -MAX_RATE_ADJUST,
+        Math.min(MAX_RATE_ADJUST, -drift * 0.5)
+      )
+      audio.playbackRate = 1 + adjust
+    }, CORRECTOR_INTERVAL_MS)
+    return () => clearInterval(id)
+  }, [joined, isLeader, targetPosition])
+
+  // Keep pitch natural during rate corrections.
+  useEffect(() => {
+    const audio = audioRef.current
+    if (!audio) return
+    try {
+      audio.preservesPitch = true
+      audio.mozPreservesPitch = true
+      audio.webkitPreservesPitch = true
+    } catch (e) {
+      /* older browsers */
+    }
+  }, [joined])
+
   // Unlock audio with a real user gesture (autoplay policy), then jump to
-  // the projected authoritative position so we come in already in sync.
+  // the shared-clock target so we come in already in sync.
   const enableAudio = () => {
     const audio = audioRef.current
     if (!audio) return
-    const s = lastState.current
     applyingRemote.current = true
-    const expected = s.playing
-      ? s.position +
-        rttRef.current / 2 / 1000 +
-        (Date.now() - (s.receivedAt || Date.now())) / 1000
-      : s.position
     try {
-      audio.currentTime = expected
+      audio.currentTime = Math.max(0, targetPosition())
     } catch (e) {
-      /* metadata not ready — the next leader_pos will correct us */
+      /* metadata not ready — the corrector will align us */
     }
     audio
       .play()

@@ -59,12 +59,23 @@ func (c *Client) readPump() {
 			log.Printf("bad message from %s: %v", c.name, err)
 			continue
 		}
-		// RTT probe: answer immediately from the read loop, bypassing the
-		// room's serialized event loop, so queueing delay does not inflate
-		// the measured ping. The payload (client timestamp) is echoed as-is.
+		// RTT/clock probe: answer immediately from the read loop, bypassing
+		// the room's serialized event loop, so queueing delay does not
+		// inflate the measured ping. We echo the client timestamp and attach
+		// the server time, letting the client estimate its clock offset
+		// NTP-style: offset = serverTime - (t + rtt/2). All clients then
+		// share one reference clock, which is what makes sample-accurate
+		// convergence possible.
 		if msg.Type == "ping" {
+			var p struct {
+				T int64 `json:"t"`
+			}
+			_ = json.Unmarshal(msg.Data, &p)
 			select {
-			case c.send <- newMessage("pong", msg.Data):
+			case c.send <- newMessage("pong", map[string]interface{}{
+				"t":          p.T,
+				"serverTime": time.Now().UnixMilli(),
+			}):
 			default:
 			}
 			continue

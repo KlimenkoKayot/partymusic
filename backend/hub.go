@@ -184,11 +184,21 @@ func (r *Room) handleMessage(in inbound) {
 		var p struct {
 			Position float64 `json:"position"`
 			Playing  bool    `json:"playing"`
+			At       int64   `json:"at"` // leader's estimate of SERVER time at capture
 		}
 		_ = json.Unmarshal(in.msg.Data, &p)
 		r.state.Position = p.Position
 		r.state.Playing = p.Playing
-		r.state.UpdatedAt = time.Now().UnixMilli()
+		// Anchor the sample at the moment the leader CAPTURED it (expressed
+		// on the server clock via the leader's NTP offset), not the moment it
+		// arrived here — that removes the leader's uplink latency from the
+		// shared timeline. Guard against garbage stamps.
+		now := time.Now().UnixMilli()
+		if p.At > 0 && p.At <= now && now-p.At < 5000 {
+			r.state.UpdatedAt = p.At
+		} else {
+			r.state.UpdatedAt = now
+		}
 		// Fan out to followers only — the leader IS the source of truth.
 		raw := r.stateMessage()
 		for c := range r.clients {
