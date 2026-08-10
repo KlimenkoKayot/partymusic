@@ -23,6 +23,10 @@ export default function App() {
   // Authoritative shared state coming from the server.
   const [trackIndex, setTrackIndex] = useState(-1)
   const [playing, setPlaying] = useState(false)
+  // Am I the room leader? The room creator (first joiner) drives playback;
+  // everyone else follows the leader's audio clock.
+  const [isLeader, setIsLeader] = useState(false)
+  const isLeaderRef = useRef(false)
 
   const wsRef = useRef(null)
   const audioRef = useRef(null)
@@ -69,6 +73,10 @@ export default function App() {
         break
       case 'chat':
         setMessages((m) => [...m, msg.data].slice(-100))
+        break
+      case 'role':
+        isLeaderRef.current = !!(msg.data && msg.data.leader)
+        setIsLeader(isLeaderRef.current)
         break
       case 'state':
         applyState(msg.data)
@@ -125,7 +133,13 @@ export default function App() {
           ? state.position + (Date.now() - receivedAt) / 1000
           : state.position
         const drift = Math.abs(audio.currentTime - target)
-        if (drift > SYNC_THRESHOLD || Number.isNaN(audio.currentTime) || trackChanged) {
+        // The leader never seeks to broadcast state (it originated from the
+        // leader's own clock — seeking to a reflection of yourself only adds
+        // jitter). Followers hard-seek on track change or noticeable drift.
+        const shouldSeek = isLeaderRef.current
+          ? trackChanged
+          : drift > SYNC_THRESHOLD || Number.isNaN(audio.currentTime) || trackChanged
+        if (shouldSeek) {
           try {
             audio.currentTime = target
           } catch (e) {
@@ -165,39 +179,32 @@ export default function App() {
     connect(roomName, userName)
   }
 
-  // Periodically ask the server for the authoritative state to correct drift.
+  // Leader: push the real <audio> clock to the server every second. The
+  // server rebroadcasts it to followers, so everyone tracks the leader's
+  // actual playback (buffering stalls included) instead of wall-clock math.
   useEffect(() => {
-    if (!joined) return
-    const id = setInterval(() => send('sync'), 4000)
-    return () => clearInterval(id)
-  }, [joined, send])
-
-  // Continuous soft drift correction while playing (no hard seeks).
-  useEffect(() => {
-    if (!joined) return
+    if (!joined || !isLeader) return
     const id = setInterval(() => {
       const audio = audioRef.current
-      const s = lastState.current
-      if (!audio || !s.playing || applyingRemote.current) return
-      // Project the last known position forward using our *client-local*
-      // receipt time. Using the server's `updatedAt` here would fold clock
-      // skew between browser and server into the target, making clients drift
-      // apart instead of together.
-      const expected =
-        s.position + (Date.now() - (s.receivedAt || Date.now())) / 1000
-      const drift = audio.currentTime - expected
-      if (Math.abs(drift) > SYNC_THRESHOLD) {
-        try {
-          audio.currentTime = expected
-        } catch (e) {
-          /* ignore */
-        }
-      }
+      if (!audio || applyingRemote.current) return
+      send('leader_pos', {
+        position: audio.currentTime || 0,
+        playing: !audio.paused && !audio.ended,
+      })
     }, 1000)
     return () => clearInterval(id)
-  }, [joined])
+  }, [joined, isLeader, send])
+
+  // Followers: periodically re-request the authoritative state as a fallback
+  // (e.g. if the leader's tab is throttled and leader_pos stops flowing).
+  useEffect(() => {
+    if (!joined || isLeader) return
+    const id = setInterval(() => send('sync'), 5000)
+    return () => clearInterval(id)
+  }, [joined, isLeader, send])
 
   // ----- User actions (broadcast to the room) ---------------------------
+  // Playback control is leader-only; the server ignores it from followers.
   const onPlay = () => send('play', { position: audioRef.current?.currentTime || 0 })
   const onPause = () => send('pause', { position: audioRef.current?.currentTime || 0 })
   const onSeek = (position) => send('seek', { position })
@@ -219,6 +226,7 @@ export default function App() {
         <div className="brand">🎵 PartyMusic</div>
         <div className="room-info">
           Room <b>{room}</b>
+          {isLeader && <span className="status online">DJ 🎛</span>}
           <span className={`status ${connected ? 'online' : 'offline'}`}>
             {connected ? 'connected' : 'reconnecting…'}
           </span>
@@ -231,6 +239,7 @@ export default function App() {
             audioRef={audioRef}
             track={currentTrack}
             playing={playing}
+            isLeader={isLeader}
             applyingRemote={applyingRemote}
             onPlay={onPlay}
             onPause={onPause}
@@ -238,7 +247,11 @@ export default function App() {
             onEnded={onEnded}
           />
           <Search enabled={yandexEnabled} onAdd={onAdd} />
-          <Playlist tracks={tracks} activeIndex={trackIndex} onSelect={onSelect} />
+          <Playlist
+            tracks={tracks}
+            activeIndex={trackIndex}
+            onSelect={isLeader ? onSelect : () => {}}
+          />
         </main>
 
         <aside className="sidebar">

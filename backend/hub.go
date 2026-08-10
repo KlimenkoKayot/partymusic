@@ -52,6 +52,11 @@ type Room struct {
 
 	clients map[*Client]bool
 
+	// leader is the client whose player clock is the room's source of truth.
+	// The first client to join (i.e. the room creator) becomes the leader;
+	// when they leave, another client is promoted.
+	leader *Client
+
 	register   chan *Client
 	unregister chan *Client
 	broadcast  chan inbound
@@ -84,11 +89,16 @@ func (r *Room) run() {
 		select {
 		case c := <-r.register:
 			r.clients[c] = true
-			// Send the current playlist + state to the new client immediately.
+			// The room creator (first client) becomes the leader.
+			if r.leader == nil {
+				r.leader = c
+			}
+			// Tell the client its role, then send playlist + state.
+			c.send <- newMessage("role", map[string]interface{}{"leader": c == r.leader})
 			c.send <- newMessage("playlist", r.playlist)
 			c.send <- r.stateMessage()
 			r.broadcastUsers()
-			log.Printf("[%s] %s joined (%d online)", r.name, c.name, len(r.clients))
+			log.Printf("[%s] %s joined (%d online, leader=%s)", r.name, c.name, len(r.clients), r.leader.name)
 
 		case c := <-r.unregister:
 			if _, ok := r.clients[c]; ok {
@@ -98,6 +108,18 @@ func (r *Room) run() {
 				if len(r.clients) == 0 {
 					r.hub.removeRoom(r.name)
 					return
+				}
+				// Promote a new leader if the leader left.
+				if c == r.leader {
+					r.leader = nil
+					for other := range r.clients {
+						r.leader = other
+						break
+					}
+					if r.leader != nil {
+						r.leader.send <- newMessage("role", map[string]interface{}{"leader": true})
+						log.Printf("[%s] %s promoted to leader", r.name, r.leader.name)
+					}
 				}
 				r.broadcastUsers()
 			}
@@ -109,9 +131,15 @@ func (r *Room) run() {
 }
 
 // handleMessage applies a client action to the shared state and re-broadcasts.
+// Playback control (play/pause/seek/select/ended) and position reports are
+// only honored when they come from the room leader — every other client is a
+// follower that merely mirrors the leader's clock.
 func (r *Room) handleMessage(in inbound) {
 	switch in.msg.Type {
 	case "play":
+		if in.client != r.leader {
+			return
+		}
 		var p struct {
 			Position float64 `json:"position"`
 		}
@@ -122,6 +150,9 @@ func (r *Room) handleMessage(in inbound) {
 		r.broadcastState()
 
 	case "pause":
+		if in.client != r.leader {
+			return
+		}
 		var p struct {
 			Position float64 `json:"position"`
 		}
@@ -132,6 +163,9 @@ func (r *Room) handleMessage(in inbound) {
 		r.broadcastState()
 
 	case "seek":
+		if in.client != r.leader {
+			return
+		}
 		var p struct {
 			Position float64 `json:"position"`
 		}
@@ -140,7 +174,39 @@ func (r *Room) handleMessage(in inbound) {
 		r.state.UpdatedAt = time.Now().UnixMilli()
 		r.broadcastState()
 
+	case "leader_pos":
+		// Periodic ground-truth position report from the leader's <audio>
+		// clock. This is what keeps followers in sync with the actual
+		// playback rather than a wall-clock projection.
+		if in.client != r.leader {
+			return
+		}
+		var p struct {
+			Position float64 `json:"position"`
+			Playing  bool    `json:"playing"`
+		}
+		_ = json.Unmarshal(in.msg.Data, &p)
+		r.state.Position = p.Position
+		r.state.Playing = p.Playing
+		r.state.UpdatedAt = time.Now().UnixMilli()
+		// Fan out to followers only — the leader IS the source of truth.
+		raw := r.stateMessage()
+		for c := range r.clients {
+			if c == r.leader {
+				continue
+			}
+			select {
+			case c.send <- raw:
+			default:
+				close(c.send)
+				delete(r.clients, c)
+			}
+		}
+
 	case "select":
+		if in.client != r.leader {
+			return
+		}
 		var p struct {
 			TrackIndex int `json:"trackIndex"`
 		}
@@ -179,6 +245,11 @@ func (r *Room) handleMessage(in inbound) {
 
 	case "ended":
 		// Auto-advance to the next track when the current one finishes.
+		// Only the leader's "ended" counts — followers may hit the end of
+		// their buffer slightly earlier or later.
+		if in.client != r.leader {
+			return
+		}
 		next := r.state.TrackIndex + 1
 		if next >= len(r.playlist) {
 			r.state.Playing = false

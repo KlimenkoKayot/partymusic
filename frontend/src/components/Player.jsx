@@ -11,6 +11,7 @@ export default function Player({
   audioRef,
   track,
   playing,
+  isLeader,
   applyingRemote,
   onPlay,
   onPause,
@@ -38,12 +39,13 @@ export default function Player({
   }, [audioRef, track])
 
   // Native play/pause events that were user-initiated get forwarded up.
+  // Only the leader drives the room; follower events are never forwarded.
   const handlePlay = () => {
-    if (applyingRemote.current) return
+    if (!isLeader || applyingRemote.current) return
     onPlay()
   }
   const handlePause = () => {
-    if (applyingRemote.current) return
+    if (!isLeader || applyingRemote.current) return
     // The browser fires a native "pause" right before "ended" when a track
     // finishes. Forwarding it would pause the whole room just as the server
     // is about to auto-advance to the next track.
@@ -52,6 +54,7 @@ export default function Player({
   }
 
   const scrub = (e) => {
+    if (!isLeader) return
     const pos = Number(e.target.value)
     if (audioRef.current) audioRef.current.currentTime = pos
     setCurrent(pos)
@@ -99,20 +102,23 @@ export default function Player({
           step="0.1"
           value={current}
           onChange={scrub}
-          disabled={!track}
+          disabled={!track || !isLeader}
         />
         <span className="time">{fmt(duration)}</span>
       </div>
 
       <div className="controls">
         {playing ? (
-          <button className="play-btn" onClick={onPause} disabled={!track}>
+          <button className="play-btn" onClick={onPause} disabled={!track || !isLeader}>
             ⏸ Pause
           </button>
         ) : (
-          <button className="play-btn" onClick={onPlay} disabled={!track}>
+          <button className="play-btn" onClick={onPlay} disabled={!track || !isLeader}>
             ▶ Play
           </button>
+        )}
+        {!isLeader && (
+          <span className="track-sub">Синхронизация с DJ комнаты</span>
         )}
       </div>
     </section>
