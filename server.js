@@ -165,7 +165,8 @@ async function getTrackStreamUrl(trackId) {
 app.post('/api/room/create', (req, res) => {
   const roomId = uuidv4().slice(0, 8).toUpperCase();
   rooms.set(roomId, {
-    id: roomId, playlist: [], currentTrack: 0, currentTime: 0,
+    id: roomId, playlist: [], currentTrack: 0,
+    position: 0, referenceTime: Date.now(),
     isPlaying: false, users: new Set(), hostId: null, createdAt: Date.now()
   });
   console.log(`Room created: ${roomId}`);
@@ -177,7 +178,8 @@ app.get('/api/room/:id', (req, res) => {
   if (!room) return res.status(404).json({ error: 'Not found' });
   res.json({
     id: room.id, playlist: room.playlist, currentTrack: room.currentTrack,
-    currentTime: room.currentTime, isPlaying: room.isPlaying, usersCount: room.users.size
+    position: room.position, referenceTime: room.referenceTime,
+    isPlaying: room.isPlaying, usersCount: room.users.size
   });
 });
 
@@ -317,6 +319,14 @@ io.on('connection', (socket) => {
   console.log(`Connected: ${socket.id}`);
   let currentRoom = null;
 
+  // ==================== Синхронизация часов (NTP-подобная, без периодических опросов) ====================
+  // Клиент шлёт clock-sync с t0 (своё время отправки), сервер отвечает своим временем.
+  // Клиент по формуле offset = serverTime - (t0 + rtt/2) вычисляет разницу часов один раз
+  // и далее сам математически экстраполирует позицию воспроизведения.
+  socket.on('clock-sync', (t0) => {
+    socket.emit('clock-sync-reply', { t0, serverTime: Date.now() });
+  });
+
   socket.on('join-room', (roomId) => {
     const room = rooms.get(roomId.toUpperCase());
     if (!room) return socket.emit('error', 'Комната не найдена');
@@ -332,7 +342,8 @@ io.on('connection', (socket) => {
 
     socket.emit('sync-state', {
       playlist: room.playlist, currentTrack: room.currentTrack,
-      currentTime: room.currentTime, isPlaying: room.isPlaying
+      position: room.position, referenceTime: room.referenceTime,
+      isPlaying: room.isPlaying, serverNow: Date.now()
     });
     io.to(currentRoom).emit('user-count', room.users.size);
   });
@@ -348,7 +359,8 @@ io.on('connection', (socket) => {
   socket.on('clear-playlist', () => {
     const room = rooms.get(currentRoom);
     if (room) {
-      room.playlist = []; room.currentTrack = 0; room.currentTime = 0; room.isPlaying = false;
+      room.playlist = []; room.currentTrack = 0;
+      room.position = 0; room.referenceTime = Date.now(); room.isPlaying = false;
       io.to(currentRoom).emit('playlist-cleared');
     }
   });
@@ -362,43 +374,53 @@ io.on('connection', (socket) => {
         room.currentTrack = room.playlist.length - 1;
       } else if (room.playlist.length === 0) {
         room.currentTrack = 0;
-        room.currentTime = 0;
+        room.position = 0; room.referenceTime = Date.now();
         room.isPlaying = false;
       } else if (index < room.currentTrack) {
         room.currentTrack--;
       } else if (index === room.currentTrack) {
-        room.currentTime = 0;
-        io.to(currentRoom).emit('track-changed', { currentTrack: room.currentTrack });
+        room.position = 0; room.referenceTime = Date.now();
+        io.to(currentRoom).emit('track-changed', {
+          currentTrack: room.currentTrack, position: room.position,
+          referenceTime: room.referenceTime, isPlaying: room.isPlaying
+        });
       }
 
       io.to(currentRoom).emit('playlist-updated', room.playlist);
     }
   });
 
-
-  socket.on('play', (time) => {
+  // Хост присылает уже посчитанные по своим часам position и serverTime
+  // (serverTime = локальное время хоста + вычисленный offset до сервера).
+  // Это устраняет влияние пинга хост->сервер: сервер просто ретранслирует
+  // точку отсчёта, а каждый клиент сам экстраполирует позицию по формуле
+  // currentPosition = position + (localServerTime - referenceTime) / 1000.
+  socket.on('play', ({ position, serverTime } = {}) => {
     const room = rooms.get(currentRoom);
     if (room) {
       room.isPlaying = true;
-      if (typeof time === 'number') room.currentTime = time;
-      io.to(currentRoom).emit('play', { time: room.currentTime });
+      room.position = typeof position === 'number' ? position : room.position;
+      room.referenceTime = typeof serverTime === 'number' ? serverTime : Date.now();
+      io.to(currentRoom).emit('play', { position: room.position, referenceTime: room.referenceTime });
     }
   });
 
-  socket.on('pause', (time) => {
+  socket.on('pause', ({ position, serverTime } = {}) => {
     const room = rooms.get(currentRoom);
     if (room) {
       room.isPlaying = false;
-      if (typeof time === 'number') room.currentTime = time;
-      io.to(currentRoom).emit('pause', { time: room.currentTime });
+      room.position = typeof position === 'number' ? position : room.position;
+      room.referenceTime = typeof serverTime === 'number' ? serverTime : Date.now();
+      io.to(currentRoom).emit('pause', { position: room.position, referenceTime: room.referenceTime });
     }
   });
 
-  socket.on('seek', (time) => {
+  socket.on('seek', ({ position, serverTime } = {}) => {
     const room = rooms.get(currentRoom);
     if (room) {
-      room.currentTime = time;
-      socket.to(currentRoom).emit('seek', { time });
+      room.position = typeof position === 'number' ? position : room.position;
+      room.referenceTime = typeof serverTime === 'number' ? serverTime : Date.now();
+      socket.to(currentRoom).emit('seek', { position: room.position, referenceTime: room.referenceTime });
     }
   });
 
@@ -406,8 +428,11 @@ io.on('connection', (socket) => {
     const room = rooms.get(currentRoom);
     if (room?.playlist.length) {
       room.currentTrack = (room.currentTrack + 1) % room.playlist.length;
-      room.currentTime = 0;
-      io.to(currentRoom).emit('track-changed', { currentTrack: room.currentTrack });
+      room.position = 0; room.referenceTime = Date.now();
+      io.to(currentRoom).emit('track-changed', {
+        currentTrack: room.currentTrack, position: room.position,
+        referenceTime: room.referenceTime, isPlaying: room.isPlaying
+      });
     }
   });
 
@@ -415,22 +440,24 @@ io.on('connection', (socket) => {
     const room = rooms.get(currentRoom);
     if (room?.playlist.length) {
       room.currentTrack = room.currentTrack === 0 ? room.playlist.length - 1 : room.currentTrack - 1;
-      room.currentTime = 0;
-      io.to(currentRoom).emit('track-changed', { currentTrack: room.currentTrack });
+      room.position = 0; room.referenceTime = Date.now();
+      io.to(currentRoom).emit('track-changed', {
+        currentTrack: room.currentTrack, position: room.position,
+        referenceTime: room.referenceTime, isPlaying: room.isPlaying
+      });
     }
   });
 
   socket.on('select-track', (i) => {
     const room = rooms.get(currentRoom);
     if (room && i >= 0 && i < room.playlist.length) {
-      room.currentTrack = i; room.currentTime = 0;
-      io.to(currentRoom).emit('track-changed', { currentTrack: i });
+      room.currentTrack = i;
+      room.position = 0; room.referenceTime = Date.now();
+      io.to(currentRoom).emit('track-changed', {
+        currentTrack: i, position: room.position,
+        referenceTime: room.referenceTime, isPlaying: room.isPlaying
+      });
     }
-  });
-
-  socket.on('time-update', (t) => {
-    const room = rooms.get(currentRoom);
-    if (room) room.currentTime = t;
   });
 
   socket.on('request-sync', () => {
@@ -438,7 +465,8 @@ io.on('connection', (socket) => {
     if (room) {
       socket.emit('sync-state', {
         playlist: room.playlist, currentTrack: room.currentTrack,
-        currentTime: room.currentTime, isPlaying: room.isPlaying
+        position: room.position, referenceTime: room.referenceTime,
+        isPlaying: room.isPlaying, serverNow: Date.now()
       });
     }
   });

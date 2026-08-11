@@ -1,4 +1,31 @@
-const state={roomId:null,socket:null,playlist:[],currentTrack:0,isPlaying:false,volume:.7,shuffle:false,repeat:false};
+const state={roomId:null,socket:null,playlist:[],currentTrack:0,isPlaying:false,volume:.7,shuffle:false,repeat:false,clockOffset:0};
+
+// ==================== Математическая синхронизация часов (без периодических опросов) ====================
+// Один обмен пакетами при подключении: t0 -> сервер -> serverTime -> t1.
+// offset = serverTime - (t0 + (t1 - t0) / 2)  (классическая формула NTP,
+// половина RTT компенсирует задержку клиент<->сервер в обе стороны).
+function syncClock(){
+  return new Promise(resolve=>{
+    const t0=Date.now();
+    const onReply=({t0:sent,serverTime})=>{
+      const t1=Date.now();
+      const rtt=t1-sent;
+      state.clockOffset=serverTime-(sent+rtt/2);
+      state.socket.off('clock-sync-reply',onReply);
+      resolve();
+    };
+    state.socket.on('clock-sync-reply',onReply);
+    state.socket.emit('clock-sync',t0);
+  });
+}
+// Текущее серверное время, вычисленное по локальным часам + offset
+function serverNow(){return Date.now()+state.clockOffset}
+// Позиция трека "сейчас", экстраполированная от точки отсчёта (position/referenceTime)
+function computePosition(position,referenceTime,isPlaying){
+  if(!isPlaying)return position;
+  const elapsed=(serverNow()-referenceTime)/1000;
+  return Math.max(0,position+elapsed);
+}
 const $=id=>document.getElementById(id);
 const el={landingScreen:$('landing-screen'),roomScreen:$('room-screen'),createRoomBtn:$('create-room-btn'),joinRoomBtn:$('join-room-btn'),roomCodeInput:$('room-code-input'),roomId:$('room-id'),usersCount:$('users-count'),copyLinkBtn:$('copy-link-btn'),syncBtn:$('sync-btn'),leaveRoomBtn:$('leave-room-btn'),tabs:document.querySelectorAll('.tab'),tabContents:document.querySelectorAll('.tab-content'),yandexLinks:$('yandex-links'),addTracksBtn:$('add-tracks-btn'),addDemoBtn:$('add-demo-btn'),searchInput:$('search-input'),searchBtn:$('search-btn'),searchResults:$('search-results'),trackCover:$('track-cover'),coverOverlay:$('cover-overlay'),trackTitle:$('track-title'),trackArtist:$('track-artist'),currentTime:$('current-time'),duration:$('duration'),progressBar:$('progress-bar'),progressFill:$('progress-fill'),shuffleBtn:$('shuffle-btn'),prevBtn:$('prev-btn'),playBtn:$('play-btn'),nextBtn:$('next-btn'),repeatBtn:$('repeat-btn'),muteBtn:$('mute-btn'),volumeSlider:$('volume-slider'),playlist:$('playlist'),playlistCount:$('playlist-count'),clearPlaylistBtn:$('clear-playlist-btn'),audio:$('audio-player'),notifications:$('notifications')};
 
@@ -14,7 +41,48 @@ function leaveRoom(){state.socket?.disconnect();state.socket=null;state.roomId=n
 
 function copyLink(){navigator.clipboard.writeText(`${location.origin}?room=${state.roomId}`).then(()=>notify('Ссылка скопирована!','success'))}
 
-function connectSocket(){state.socket=io();state.socket.on('connect',()=>state.socket.emit('join-room',state.roomId));state.socket.on('error',m=>notify(m,'error'));state.socket.on('you-are-host',()=>notify('Вы хост','info'));state.socket.on('user-count',c=>el.usersCount.textContent=c);state.socket.on('sync-state',async d=>{state.playlist=d.playlist;state.currentTrack=d.currentTrack;state.isPlaying=d.isPlaying;renderPlaylist();await loadTrack();if(el.audio.src){el.audio.currentTime=d.currentTime;updatePlayBtn(d.isPlaying);if(d.isPlaying){el.audio.play().catch(()=>{})}}});state.socket.on('playlist-updated',p=>{state.playlist=p;renderPlaylist();if(state.playlist.length===1)loadTrack();notify('Плейлист обновлён','info')});state.socket.on('playlist-cleared',()=>{state.playlist=[];state.currentTrack=0;state.isPlaying=false;el.audio.pause();el.audio.src='';renderPlaylist();updateNowPlaying(null);notify('Плейлист очищен','info')});state.socket.on('play',({time})=>{state.isPlaying=true;el.audio.currentTime=time;el.audio.play().catch(()=>{})});state.socket.on('pause',({time})=>{state.isPlaying=false;el.audio.currentTime=time;el.audio.pause()});state.socket.on('seek',({time})=>{el.audio.currentTime=time});state.socket.on('track-changed',async({currentTrack:t})=>{state.currentTrack=t;await loadTrack();renderPlaylist();if(state.isPlaying&&el.audio.src){el.audio.play().catch(()=>{})}});state.socket.on('disconnect',()=>notify('Соединение потеряно','error'))}
+function connectSocket(){
+  state.socket=io();
+  state.socket.on('connect',async()=>{await syncClock();state.socket.emit('join-room',state.roomId)});
+  state.socket.on('error',m=>notify(m,'error'));
+  state.socket.on('you-are-host',()=>notify('Вы хост','info'));
+  state.socket.on('user-count',c=>el.usersCount.textContent=c);
+  state.socket.on('sync-state',async d=>{
+    state.playlist=d.playlist;state.currentTrack=d.currentTrack;state.isPlaying=d.isPlaying;
+    renderPlaylist();await loadTrack();
+    if(el.audio.src){
+      const pos=computePosition(d.position,d.referenceTime,d.isPlaying);
+      el.audio.currentTime=pos;
+      updatePlayBtn(d.isPlaying);
+      if(d.isPlaying)el.audio.play().catch(()=>{})
+    }
+  });
+  state.socket.on('playlist-updated',p=>{state.playlist=p;renderPlaylist();if(state.playlist.length===1)loadTrack();notify('Плейлист обновлён','info')});
+  state.socket.on('playlist-cleared',()=>{state.playlist=[];state.currentTrack=0;state.isPlaying=false;el.audio.pause();el.audio.src='';renderPlaylist();updateNowPlaying(null);notify('Плейлист очищен','info')});
+  state.socket.on('play',({position,referenceTime})=>{
+    state.isPlaying=true;
+    el.audio.currentTime=computePosition(position,referenceTime,true);
+    el.audio.play().catch(()=>{})
+  });
+  state.socket.on('pause',({position})=>{
+    state.isPlaying=false;
+    el.audio.currentTime=position;
+    el.audio.pause()
+  });
+  state.socket.on('seek',({position,referenceTime})=>{
+    el.audio.currentTime=computePosition(position,referenceTime,state.isPlaying)
+  });
+  state.socket.on('track-changed',async({currentTrack:t,position,referenceTime,isPlaying})=>{
+    state.currentTrack=t;
+    await loadTrack();
+    renderPlaylist();
+    if(el.audio.src){
+      el.audio.currentTime=computePosition(position??0,referenceTime??serverNow(),isPlaying??state.isPlaying);
+      if((isPlaying??state.isPlaying))el.audio.play().catch(()=>{})
+    }
+  });
+  state.socket.on('disconnect',()=>notify('Соединение потеряно','error'))
+}
 
 async function addTracks(){const t=el.yandexLinks.value.trim();if(!t)return notify('Введите ссылку','error');el.addTracksBtn.disabled=true;el.addTracksBtn.innerHTML='<span class="loading"></span>';let all=[];for(const l of t.split('\n').filter(x=>x.trim())){if(l.includes('music.yandex')){try{const r=await fetch('/api/yandex/parse',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:l.trim()})});const d=await r.json();if(d.tracks?.length)all.push(...d.tracks)}catch{}}}el.addTracksBtn.disabled=false;el.addTracksBtn.innerHTML='<i class="fas fa-plus"></i> Добавить';if(all.length){state.socket?.emit('add-tracks',all);el.yandexLinks.value='';notify(`Добавлено ${all.length} треков`,'success')}else notify('Треки не найдены','error')}
 
@@ -32,11 +100,11 @@ async function loadTrack(){if(!state.playlist.length){updateNowPlaying(null);ret
 
 function updateNowPlaying(t){if(!t){el.trackTitle.textContent='Выберите трек';el.trackArtist.textContent='—';el.trackCover.src=PLACEHOLDER_COVER;el.currentTime.textContent='0:00';el.duration.textContent='0:00';el.progressFill.style.width='0%';return}el.trackTitle.textContent=t.title;el.trackArtist.textContent=t.artist;el.trackCover.src=t.cover||PLACEHOLDER_COVER}
 
-function togglePlay(){if(!state.playlist.length)return notify('Плейлист пуст','info');if(el.audio.paused){el.audio.play().then(()=>state.socket?.emit('play',el.audio.currentTime)).catch(()=>notify('Не удалось воспроизвести','error'))}else{el.audio.pause();state.socket?.emit('pause',el.audio.currentTime)}}
+function togglePlay(){if(!state.playlist.length)return notify('Плейлист пуст','info');if(el.audio.paused){el.audio.play().then(()=>state.socket?.emit('play',{position:el.audio.currentTime,serverTime:serverNow()})).catch(()=>notify('Не удалось воспроизвести','error'))}else{el.audio.pause();state.socket?.emit('pause',{position:el.audio.currentTime,serverTime:serverNow()})}}
 
-function handleSeek(e){const r=el.progressBar.getBoundingClientRect();const p=(e.clientX-r.left)/r.width;const t=p*el.audio.duration;el.audio.currentTime=t;state.socket?.emit('seek',t)}
+function handleSeek(e){const r=el.progressBar.getBoundingClientRect();const p=(e.clientX-r.left)/r.width;const t=p*el.audio.duration;el.audio.currentTime=t;state.socket?.emit('seek',{position:t,serverTime:serverNow()})}
 
-function handleTime(){const c=el.audio.currentTime;const d=el.audio.duration||0;el.currentTime.textContent=fmt(c);if(d>0)el.progressFill.style.width=`${(c/d)*100}%`;if(Math.floor(c)%5===0)state.socket?.emit('time-update',c)}
+function handleTime(){const c=el.audio.currentTime;const d=el.audio.duration||0;el.currentTime.textContent=fmt(c);if(d>0)el.progressFill.style.width=`${(c/d)*100}%`}
 
 function updatePlayBtn(p){const i=p?'fa-pause':'fa-play';el.playBtn.querySelector('i').className=`fas ${i}`;el.coverOverlay.querySelector('i').className=`fas ${i}`}
 
