@@ -5,11 +5,20 @@ const crypto = require('crypto');
 const { Server } = require('socket.io');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
+const { performance } = require('perf_hooks');
+
+// Монотонные «серверные часы»: не прыгают от NTP-коррекции и перевода времени
+const nowMs = () => performance.timeOrigin + performance.now();
+
+const TRACK_CHANGE_LEAD_MS = 1200;   // старт нового трека в будущем — все успевают догрузить буфер
+const TRACK_CHANGE_MIN_GAP_MS = 300; // микро-антидребезг (двойной клик по одной кнопке)
+const STALE_CMD_WINDOW_MS = 1000;    // окно, в котором отбрасываем команды с устаревшим `from`
+const AUTO_ADVANCE_GRACE_MS = 250;   // запас перед автопереходом на следующий трек
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" },
+  cors: { origin: '*' },
   pingTimeout: 60000,
   pingInterval: 25000
 });
@@ -17,7 +26,6 @@ const io = new Server(server, {
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-// Health check
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // ==================== Хранилище ====================
@@ -25,13 +33,12 @@ const rooms = new Map();
 const trackUrlCache = new Map();
 
 // ==================== ТОКЕН ЯНДЕКС.МУЗЫКИ ====================
-// Вставьте ваш токен сюда или используйте переменную окружения
 const YM_TOKEN = process.env.YM_TOKEN || 'YOUR_TOKEN_HERE';
 
 const YM_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
   'Accept': 'application/json',
-  'Authorization': `OAuth ${YM_TOKEN}`  // <-- ВАЖНО: добавлен токен
+  'Authorization': `OAuth ${YM_TOKEN}`
 };
 
 // Очистка каждый час
@@ -39,6 +46,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [id, room] of rooms) {
     if (room.users.size === 0 && now - room.createdAt > 3600000) {
+      clearAutoAdvance(room);
       rooms.delete(id);
     }
   }
@@ -110,53 +118,142 @@ function formatTrack(track) {
 
 async function getTrackStreamUrl(trackId) {
   try {
-    console.log(`Getting stream URL for track ${trackId}...`);
-
-    // Запрашиваем информацию о загрузке
     const info = await ymRequest(`/tracks/${trackId}/download-info`);
+    if (!info.result?.length) return null;
 
-    if (!info.result?.length) {
-      console.log('No download info available');
-      return null;
-    }
-
-    console.log('Available formats:', info.result.map(i => `${i.codec} ${i.bitrateInKbps}kbps`));
-
-    // Выбираем лучшее качество MP3
     const formats = info.result.filter(i => i.codec === 'mp3');
-    if (!formats.length) {
-      console.log('No MP3 format available');
-      return null;
-    }
+    if (!formats.length) return null;
 
     const best = formats.sort((a, b) => b.bitrateInKbps - a.bitrateInKbps)[0];
-    console.log(`Selected: ${best.codec} ${best.bitrateInKbps}kbps`);
-
-    // Получаем XML с информацией для скачивания
     const xml = await fetchText(best.downloadInfoUrl);
 
     const host = xml.match(/<host>([^<]+)/)?.[1];
     const xmlPath = xml.match(/<path>([^<]+)/)?.[1];
     const ts = xml.match(/<ts>([^<]+)/)?.[1];
     const s = xml.match(/<s>([^<]+)/)?.[1];
+    if (!host || !xmlPath || !ts || !s) return null;
 
-    if (!host || !xmlPath || !ts || !s) {
-      console.log('Failed to parse download XML');
-      return null;
-    }
-
-    // Формируем подпись
     const sign = crypto.createHash('md5')
       .update(`XGRlBW9FXlekgbPrRHuSiA${xmlPath.slice(1)}${s}`)
       .digest('hex');
 
-    const streamUrl = `https://${host}/get-mp3/${sign}/${ts}${xmlPath}`;
-    console.log('Stream URL generated successfully');
-
-    return streamUrl;
+    return `https://${host}/get-mp3/${sign}/${ts}${xmlPath}`;
   } catch (e) {
     console.error('getTrackStreamUrl error:', e.message);
     return null;
+  }
+}
+
+// Кэш подписанных ссылок: 13 минут (Яндекс отдаёт ~15)
+async function resolveStreamUrl(trackId, force = false) {
+  const cached = trackUrlCache.get(trackId);
+  if (!force && cached && cached.expires > Date.now()) return cached.url;
+  const url = await getTrackStreamUrl(trackId);
+  if (url) trackUrlCache.set(trackId, { url, expires: Date.now() + 780000 });
+  return url;
+}
+
+// ==================== Логика комнаты ====================
+
+function roomPosition(room) {
+  if (!room.isPlaying) return room.position;
+  const now = nowMs();
+  if (room.startAt && now < room.startAt) return room.position;
+  return Math.max(0, room.position + (now - room.referenceTime) / 1000);
+}
+
+function currentDuration(room) {
+  const t = room.playlist[room.currentTrack];
+  return t && t.duration > 0 ? t.duration : 0;
+}
+
+function clearAutoAdvance(room) {
+  if (room.timer) { clearTimeout(room.timer); room.timer = null; }
+}
+
+// #4 / #9: автопереход рулит СЕРВЕР. Хост нужен только как fallback,
+// когда длительность трека неизвестна (демо-ссылки без duration).
+function scheduleAutoAdvance(room) {
+  clearAutoAdvance(room);
+  if (!room.isPlaying || !room.playlist.length || room.users.size === 0) return;
+  const dur = currentDuration(room);
+  if (!dur) return;
+  const leftMs = (dur - roomPosition(room)) * 1000 + AUTO_ADVANCE_GRACE_MS;
+  room.timer = setTimeout(() => {
+    room.timer = null;
+    autoAdvance(room);
+  }, Math.max(0, Math.min(leftMs, 2147483000)));
+}
+
+function pickNext(room) {
+  if (room.playlist.length < 2) return 0;
+  if (room.shuffle) {
+    let r;
+    do { r = Math.floor(Math.random() * room.playlist.length); } while (r === room.currentTrack);
+    return r;
+  }
+  return (room.currentTrack + 1) % room.playlist.length;
+}
+
+function autoAdvance(room) {
+  if (!room.isPlaying || !room.playlist.length) return;
+  // #9: repeat — повтор текущего трека, форсируем мимо антидребезга
+  if (room.repeat) return changeTrack(room, room.currentTrack, true);
+  changeTrack(room, pickNext(room), true);
+}
+
+function changeTrack(room, index, force = false) {
+  if (index < 0 || index >= room.playlist.length) return false;
+  const now = nowMs();
+  if (!force && now - room.lastChange < TRACK_CHANGE_MIN_GAP_MS) return false;
+
+  room.lastChange = now;
+  room.currentTrack = index;
+  room.position = 0;
+  room.referenceTime = now + TRACK_CHANGE_LEAD_MS;
+  room.startAt = room.referenceTime;
+  room.rev++;
+
+  io.to(room.id).emit('track-changed', {
+    currentTrack: room.currentTrack,
+    position: room.position,
+    referenceTime: room.referenceTime,
+    startAt: room.startAt,
+    isPlaying: room.isPlaying,
+    rev: room.rev
+  });
+  scheduleAutoAdvance(room);
+  return true;
+}
+
+function emitPlaylist(room) {
+  io.to(room.id).emit('playlist-updated', {
+    playlist: room.playlist,
+    currentTrack: room.currentTrack
+  });
+}
+
+function snapshot(room) {
+  return {
+    playlist: room.playlist,
+    currentTrack: room.currentTrack,
+    position: room.position,
+    referenceTime: room.referenceTime,
+    startAt: room.startAt || 0,
+    isPlaying: room.isPlaying,
+    shuffle: room.shuffle,
+    repeat: room.repeat,
+    rev: room.rev,
+    hostId: room.hostId,
+    serverNow: nowMs()
+  };
+}
+
+// #4: хост переизбирается и когда протух, и когда комната опустела
+function ensureHost(room) {
+  if (!room.hostId || !room.users.has(room.hostId)) {
+    room.hostId = room.users.size ? room.users.values().next().value : null;
+    io.to(room.id).emit('host-changed', room.hostId);
   }
 }
 
@@ -166,8 +263,10 @@ app.post('/api/room/create', (req, res) => {
   const roomId = uuidv4().slice(0, 8).toUpperCase();
   rooms.set(roomId, {
     id: roomId, playlist: [], currentTrack: 0,
-    position: 0, referenceTime: Date.now(),
-    isPlaying: false, users: new Set(), hostId: null, createdAt: Date.now()
+    position: 0, referenceTime: nowMs(), startAt: 0,
+    isPlaying: false, shuffle: false, repeat: false,
+    users: new Set(), hostId: null, createdAt: Date.now(),
+    lastChange: 0, rev: 0, timer: null
   });
   console.log(`Room created: ${roomId}`);
   res.json({ roomId });
@@ -176,14 +275,9 @@ app.post('/api/room/create', (req, res) => {
 app.get('/api/room/:id', (req, res) => {
   const room = rooms.get(req.params.id.toUpperCase());
   if (!room) return res.status(404).json({ error: 'Not found' });
-  res.json({
-    id: room.id, playlist: room.playlist, currentTrack: room.currentTrack,
-    position: room.position, referenceTime: room.referenceTime,
-    isPlaying: room.isPlaying, usersCount: room.users.size
-  });
+  res.json({ ...snapshot(room), usersCount: room.users.size });
 });
 
-// Проверка токена
 app.get('/api/yandex/status', async (req, res) => {
   try {
     const data = await ymRequest('/account/status');
@@ -201,11 +295,9 @@ app.post('/api/yandex/parse', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL required' });
 
-  console.log(`Parsing: ${url}`);
   try {
     let tracks = [];
 
-    // Плейлист: /users/{owner}/playlists/{kind}
     const plMatch = url.match(/users\/([^\/]+)\/playlists\/(\d+)/);
     if (plMatch) {
       const data = await ymRequest(`/users/${plMatch[1]}/playlists/${plMatch[2]}`);
@@ -214,25 +306,20 @@ app.post('/api/yandex/parse', async (req, res) => {
       }
     }
 
-    // Альбом: /album/{id}
     const albMatch = url.match(/album\/(\d+)(?!.*\/track)/);
     if (albMatch && !plMatch) {
       const data = await ymRequest(`/albums/${albMatch[1]}/with-tracks`);
       if (data.result?.volumes) {
-        for (const vol of data.result.volumes) {
-          tracks.push(...vol.map(formatTrack).filter(Boolean));
-        }
+        for (const vol of data.result.volumes) tracks.push(...vol.map(formatTrack).filter(Boolean));
       }
     }
 
-    // Трек: /album/{id}/track/{id}
     const trkMatch = url.match(/album\/\d+\/track\/(\d+)/);
     if (trkMatch) {
       const data = await ymRequest(`/tracks/${trkMatch[1]}`);
       if (data.result?.[0]) tracks = [formatTrack(data.result[0])].filter(Boolean);
     }
 
-    console.log(`Found ${tracks.length} tracks`);
     res.json({ tracks, count: tracks.length });
   } catch (e) {
     console.error('Parse error:', e.message);
@@ -240,33 +327,9 @@ app.post('/api/yandex/parse', async (req, res) => {
   }
 });
 
-app.get('/api/yandex/track/:id/stream', async (req, res) => {
-  const { id } = req.params;
-
-  // Проверяем кэш
-  const cached = trackUrlCache.get(id);
-  if (cached && cached.expires > Date.now()) {
-    console.log(`Using cached URL for track ${id}`);
-    return res.json({ url: cached.url, cached: true });
-  }
-
-  const url = await getTrackStreamUrl(id);
-  if (!url) {
-    return res.status(404).json({
-      error: 'Track not available',
-      hint: 'Check if YM_TOKEN is set and account has Plus subscription'
-    });
-  }
-
-  // Кэшируем на 15 минут
-  trackUrlCache.set(id, { url, expires: Date.now() + 900000 });
-  res.json({ url, cached: false });
-});
-
 app.get('/api/yandex/search', async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ error: 'Query required' });
-
   try {
     const data = await ymRequest(`/search?type=track&text=${encodeURIComponent(q)}&page=0&pageSize=20`);
     const tracks = data.result?.tracks?.results?.map(formatTrack).filter(Boolean) || [];
@@ -276,214 +339,264 @@ app.get('/api/yandex/search', async (req, res) => {
   }
 });
 
-// Прокси для аудио (обход CORS)
+// Оставлено для совместимости (сообщает клиенту стабильный URL)
+app.get('/api/yandex/track/:id/stream', (req, res) => {
+  res.json({ url: `/api/stream/${encodeURIComponent(req.params.id)}` });
+});
+
+// ==================== #15: стабильный кэшируемый стрим ====================
+// Один и тот же URL для всех клиентов => одинаковое поведение кэша браузера/CDN
+// => одинаковое время буферизации => меньше разброса на старте.
+const ALLOWED_STREAM_HOST = /(^|\.)(yandex\.net|yandex\.ru|yandexcloud\.net)$/i;
+
+function pipeUpstream(streamUrl, req, res, onExpired) {
+  let target;
+  try { target = new URL(streamUrl); } catch { return res.status(400).end(); }
+  if (target.protocol !== 'https:' || !ALLOWED_STREAM_HOST.test(target.hostname)) {
+    return res.status(403).send('Host not allowed');
+  }
+
+  const upstream = https.get(target, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': '*/*',
+      ...(req.headers.range ? { Range: req.headers.range } : {})
+    },
+    timeout: 30000
+  }, (up) => {
+    // Подпись протухла — один раз пробуем перевыпустить
+    if ((up.statusCode === 403 || up.statusCode === 410) && onExpired) {
+      up.resume();
+      return onExpired();
+    }
+    if (res.headersSent) { up.resume(); return; }
+    res.writeHead(up.statusCode, {
+      'Content-Type': up.headers['content-type'] || 'audio/mpeg',
+      ...(up.headers['content-length'] && { 'Content-Length': up.headers['content-length'] }),
+      ...(up.headers['content-range'] && { 'Content-Range': up.headers['content-range'] }),
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'public, max-age=3600',
+      'Access-Control-Allow-Origin': '*'
+    });
+    up.pipe(res);
+    res.on('close', () => up.destroy());
+  });
+
+  upstream.on('error', (e) => {
+    console.error('Stream error:', e.message);
+    if (!res.headersSent) res.status(502).send('Upstream error');
+    else res.end();
+  });
+  upstream.on('timeout', () => upstream.destroy());
+}
+
+app.get('/api/stream/:id', async (req, res) => {
+  const id = String(req.params.id).replace(/[^\w-]/g, '');
+  if (!id) return res.status(400).send('Bad id');
+
+  const url = await resolveStreamUrl(id);
+  if (!url) return res.status(404).json({ error: 'Track not available' });
+
+  pipeUpstream(url, req, res, async () => {
+    const fresh = await resolveStreamUrl(id, true);
+    if (!fresh) { if (!res.headersSent) res.status(404).end(); return; }
+    pipeUpstream(fresh, req, res, null);
+  });
+});
+
+// #15: старый прокси закрыт whitelist-ом (был открытый SSRF)
 app.get('/api/proxy', (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).send('URL required');
-
-  try {
-    const proxyReq = https.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': '*/*',
-        'Range': req.headers.range || 'bytes=0-'
-      },
-      timeout: 30000
-    }, (proxyRes) => {
-      // Логируем информацию о файле
-      console.log(`Proxying audio: ${proxyRes.statusCode}, Content-Length: ${proxyRes.headers['content-length']}`);
-
-      res.writeHead(proxyRes.statusCode, {
-        'Content-Type': proxyRes.headers['content-type'] || 'audio/mpeg',
-        'Content-Length': proxyRes.headers['content-length'],
-        'Accept-Ranges': 'bytes',
-        'Content-Range': proxyRes.headers['content-range'],
-        'Access-Control-Allow-Origin': '*'
-      });
-      proxyRes.pipe(res);
-    });
-
-    proxyReq.on('error', (e) => {
-      console.error('Proxy error:', e.message);
-      if (!res.headersSent) res.status(500).send('Proxy error');
-    });
-  } catch (e) {
-    console.error('Proxy error:', e.message);
-    res.status(500).send('Error');
-  }
+  pipeUpstream(url, req, res, null);
 });
 
 // ==================== WebSocket ====================
 
 io.on('connection', (socket) => {
-  console.log(`Connected: ${socket.id}`);
   let currentRoom = null;
+  const getRoom = () => (currentRoom ? rooms.get(currentRoom) : null);
 
-  // ==================== Синхронизация часов (NTP-подобная, без периодических опросов) ====================
-  // Клиент шлёт clock-sync с t0 (своё время отправки), сервер отвечает своим временем.
-  // Клиент по формуле offset = serverTime - (t0 + rtt/2) вычисляет разницу часов один раз
-  // и далее сам математически экстраполирует позицию воспроизведения.
+  // Сервер только отвечает монотонным временем; усреднение — на клиенте
   socket.on('clock-sync', (t0) => {
-    socket.emit('clock-sync-reply', { t0, serverTime: Date.now() });
+    socket.emit('clock-sync-reply', { t0, serverTime: nowMs() });
   });
 
   socket.on('join-room', (roomId) => {
-    const room = rooms.get(roomId.toUpperCase());
+    const room = rooms.get(String(roomId || '').toUpperCase());
     if (!room) return socket.emit('error', 'Комната не найдена');
 
-    currentRoom = roomId.toUpperCase();
+    currentRoom = room.id;
     socket.join(currentRoom);
     room.users.add(socket.id);
+    ensureHost(room);
 
-    if (!room.hostId) {
-      room.hostId = socket.id;
-      socket.emit('you-are-host');
-    }
-
-    socket.emit('sync-state', {
-      playlist: room.playlist, currentTrack: room.currentTrack,
-      position: room.position, referenceTime: room.referenceTime,
-      isPlaying: room.isPlaying, serverNow: Date.now()
-    });
+    socket.emit('sync-state', snapshot(room));
     io.to(currentRoom).emit('user-count', room.users.size);
+    io.to(currentRoom).emit('host-changed', room.hostId);
+    scheduleAutoAdvance(room);
   });
 
   socket.on('add-tracks', (tracks) => {
-    const room = rooms.get(currentRoom);
-    if (room) {
-      room.playlist.push(...tracks);
-      io.to(currentRoom).emit('playlist-updated', room.playlist);
-    }
+    const room = getRoom();
+    if (!room || !Array.isArray(tracks)) return;
+    room.playlist.push(...tracks);
+    emitPlaylist(room);
+    scheduleAutoAdvance(room);
+  });
+
+  // #7: клиент сообщает реальную длительность (для треков без duration)
+  socket.on('report-duration', ({ index, duration } = {}) => {
+    const room = getRoom();
+    if (!room || typeof index !== 'number' || !(duration > 0)) return;
+    const t = room.playlist[index];
+    if (!t || t.duration > 0) return;
+    t.duration = Math.floor(duration);
+    emitPlaylist(room);
+    if (index === room.currentTrack) scheduleAutoAdvance(room);
   });
 
   socket.on('clear-playlist', () => {
-    const room = rooms.get(currentRoom);
-    if (room) {
-      room.playlist = []; room.currentTrack = 0;
-      room.position = 0; room.referenceTime = Date.now(); room.isPlaying = false;
-      io.to(currentRoom).emit('playlist-cleared');
-    }
+    const room = getRoom();
+    if (!room) return;
+    clearAutoAdvance(room);
+    room.playlist = []; room.currentTrack = 0;
+    room.position = 0; room.referenceTime = nowMs(); room.startAt = 0;
+    room.isPlaying = false; room.rev++;
+    io.to(currentRoom).emit('playlist-cleared');
   });
+
   socket.on('remove-track', (index) => {
-    const room = rooms.get(currentRoom);
-    if (room && index >= 0 && index < room.playlist.length) {
-      room.playlist.splice(index, 1);
+    const room = getRoom();
+    if (!room || !(index >= 0 && index < room.playlist.length)) return;
 
-      // Adjust current track index if needed
-      if (room.currentTrack >= room.playlist.length && room.playlist.length > 0) {
-        room.currentTrack = room.playlist.length - 1;
-      } else if (room.playlist.length === 0) {
-        room.currentTrack = 0;
-        room.position = 0; room.referenceTime = Date.now();
-        room.isPlaying = false;
-      } else if (index < room.currentTrack) {
-        room.currentTrack--;
-      } else if (index === room.currentTrack) {
-        room.position = 0; room.referenceTime = Date.now();
-        io.to(currentRoom).emit('track-changed', {
-          currentTrack: room.currentTrack, position: room.position,
-          referenceTime: room.referenceTime, isPlaying: room.isPlaying
-        });
-      }
+    room.playlist.splice(index, 1);
 
-      io.to(currentRoom).emit('playlist-updated', room.playlist);
+    if (!room.playlist.length) {
+      clearAutoAdvance(room);
+      room.currentTrack = 0; room.position = 0;
+      room.referenceTime = nowMs(); room.startAt = 0; room.isPlaying = false;
+      emitPlaylist(room);
+      io.to(currentRoom).emit('track-changed', {
+        currentTrack: 0, position: 0, referenceTime: room.referenceTime,
+        startAt: 0, isPlaying: false, rev: ++room.rev
+      });
+      return;
+    }
+
+    if (index < room.currentTrack) {
+      room.currentTrack--;
+      emitPlaylist(room);           // #7: индекс уехал — сообщаем клиентам
+      scheduleAutoAdvance(room);
+    } else if (index === room.currentTrack) {
+      if (room.currentTrack >= room.playlist.length) room.currentTrack = 0;
+      emitPlaylist(room);
+      changeTrack(room, room.currentTrack, true);   // #14: через changeTrack => есть startAt
+    } else {
+      emitPlaylist(room);
     }
   });
 
-  // Хост присылает уже посчитанные по своим часам position и serverTime
-  // (serverTime = локальное время хоста + вычисленный offset до сервера).
-  // Это устраняет влияние пинга хост->сервер: сервер просто ретранслирует
-  // точку отсчёта, а каждый клиент сам экстраполирует позицию по формуле
-  // currentPosition = position + (localServerTime - referenceTime) / 1000.
+  // Инициатор применяет действие локально сам, поэтому обратно ему не шлём (эхо)
   socket.on('play', ({ position, serverTime } = {}) => {
-    const room = rooms.get(currentRoom);
-    if (room) {
-      room.isPlaying = true;
-      room.position = typeof position === 'number' ? position : room.position;
-      room.referenceTime = typeof serverTime === 'number' ? serverTime : Date.now();
-      io.to(currentRoom).emit('play', { position: room.position, referenceTime: room.referenceTime });
-    }
+    const room = getRoom();
+    if (!room) return;
+    room.isPlaying = true;
+    if (typeof position === 'number' && isFinite(position)) room.position = Math.max(0, position);
+    room.referenceTime = (typeof serverTime === 'number' && isFinite(serverTime)) ? serverTime : nowMs();
+    room.startAt = 0; room.rev++;
+    socket.to(currentRoom).emit('play', {
+      position: room.position, referenceTime: room.referenceTime, startAt: 0, rev: room.rev
+    });
+    scheduleAutoAdvance(room);
   });
 
   socket.on('pause', ({ position, serverTime } = {}) => {
-    const room = rooms.get(currentRoom);
-    if (room) {
-      room.isPlaying = false;
-      room.position = typeof position === 'number' ? position : room.position;
-      room.referenceTime = typeof serverTime === 'number' ? serverTime : Date.now();
-      io.to(currentRoom).emit('pause', { position: room.position, referenceTime: room.referenceTime });
-    }
+    const room = getRoom();
+    if (!room) return;
+    clearAutoAdvance(room);
+    room.isPlaying = false;
+    if (typeof position === 'number' && isFinite(position)) room.position = Math.max(0, position);
+    room.referenceTime = (typeof serverTime === 'number' && isFinite(serverTime)) ? serverTime : nowMs();
+    room.startAt = 0; room.rev++;
+    socket.to(currentRoom).emit('pause', {
+      position: room.position, referenceTime: room.referenceTime, startAt: 0, rev: room.rev
+    });
   });
 
   socket.on('seek', ({ position, serverTime } = {}) => {
-    const room = rooms.get(currentRoom);
-    if (room) {
-      room.position = typeof position === 'number' ? position : room.position;
-      room.referenceTime = typeof serverTime === 'number' ? serverTime : Date.now();
-      socket.to(currentRoom).emit('seek', { position: room.position, referenceTime: room.referenceTime });
-    }
+    const room = getRoom();
+    if (!room) return;
+    if (typeof position === 'number' && isFinite(position)) room.position = Math.max(0, position);
+    room.referenceTime = (typeof serverTime === 'number' && isFinite(serverTime)) ? serverTime : nowMs();
+    room.startAt = 0; room.rev++;
+    socket.to(currentRoom).emit('seek', {
+      position: room.position, referenceTime: room.referenceTime,
+      startAt: 0, isPlaying: room.isPlaying, rev: room.rev
+    });
+    scheduleAutoAdvance(room);
   });
 
-  socket.on('next-track', () => {
-    const room = rooms.get(currentRoom);
-    if (room?.playlist.length) {
-      room.currentTrack = (room.currentTrack + 1) % room.playlist.length;
-      room.position = 0; room.referenceTime = Date.now();
-      io.to(currentRoom).emit('track-changed', {
-        currentTrack: room.currentTrack, position: room.position,
-        referenceTime: room.referenceTime, isPlaying: room.isPlaying
-      });
-    }
+  // #11: вместо «глухого» дебаунса — идемпотентность по `from`.
+  // Дубликаты-гонки (одновременные onended) отсекаются, осознанный повтор — нет.
+  function isStale(room, from) {
+    return typeof from === 'number'
+      && from !== room.currentTrack
+      && nowMs() - room.lastChange < STALE_CMD_WINDOW_MS;
+  }
+
+  socket.on('next-track', ({ from } = {}) => {
+    const room = getRoom();
+    if (!room?.playlist.length || isStale(room, from)) return;
+    if (room.repeat) return changeTrack(room, room.currentTrack, true);
+    changeTrack(room, pickNext(room));
   });
 
-  socket.on('prev-track', () => {
-    const room = rooms.get(currentRoom);
-    if (room?.playlist.length) {
-      room.currentTrack = room.currentTrack === 0 ? room.playlist.length - 1 : room.currentTrack - 1;
-      room.position = 0; room.referenceTime = Date.now();
-      io.to(currentRoom).emit('track-changed', {
-        currentTrack: room.currentTrack, position: room.position,
-        referenceTime: room.referenceTime, isPlaying: room.isPlaying
-      });
-    }
+  socket.on('prev-track', ({ from } = {}) => {
+    const room = getRoom();
+    if (!room?.playlist.length || isStale(room, from)) return;
+    changeTrack(room, room.currentTrack === 0 ? room.playlist.length - 1 : room.currentTrack - 1);
   });
 
-  socket.on('select-track', (i) => {
-    const room = rooms.get(currentRoom);
-    if (room && i >= 0 && i < room.playlist.length) {
-      room.currentTrack = i;
-      room.position = 0; room.referenceTime = Date.now();
-      io.to(currentRoom).emit('track-changed', {
-        currentTrack: i, position: room.position,
-        referenceTime: room.referenceTime, isPlaying: room.isPlaying
-      });
-    }
+  socket.on('select-track', (payload) => {
+    const room = getRoom();
+    if (!room) return;
+    const i = typeof payload === 'object' && payload ? payload.index : payload;
+    if (!(i >= 0 && i < room.playlist.length)) return;
+    changeTrack(room, i, true);
+  });
+
+  socket.on('set-mode', ({ shuffle, repeat } = {}) => {
+    const room = getRoom();
+    if (!room) return;
+    if (typeof shuffle === 'boolean') room.shuffle = shuffle;
+    if (typeof repeat === 'boolean') room.repeat = repeat;
+    io.to(currentRoom).emit('mode-changed', { shuffle: room.shuffle, repeat: room.repeat });
   });
 
   socket.on('request-sync', () => {
-    const room = rooms.get(currentRoom);
-    if (room) {
-      socket.emit('sync-state', {
-        playlist: room.playlist, currentTrack: room.currentTrack,
-        position: room.position, referenceTime: room.referenceTime,
-        isPlaying: room.isPlaying, serverNow: Date.now()
-      });
-    }
+    const room = getRoom();
+    if (room) socket.emit('sync-state', snapshot(room));
   });
 
   socket.on('disconnect', () => {
-    console.log(`Disconnected: ${socket.id}`);
-    if (currentRoom) {
-      const room = rooms.get(currentRoom);
-      if (room) {
-        room.users.delete(socket.id);
-        io.to(currentRoom).emit('user-count', room.users.size);
-        if (room.hostId === socket.id && room.users.size > 0) {
-          room.hostId = room.users.values().next().value;
-          io.to(room.hostId).emit('you-are-host');
-        }
-      }
+    const room = getRoom();
+    if (!room) return;
+    room.users.delete(socket.id);
+
+    if (room.users.size === 0) {
+      // Замораживаем позицию: иначе через час «воспроизведение» уедет далеко за конец трека
+      room.position = roomPosition(room);
+      room.referenceTime = nowMs();
+      room.startAt = 0;
+      room.isPlaying = false;
+      room.hostId = null;
+      clearAutoAdvance(room);
+      return;
     }
+
+    io.to(room.id).emit('user-count', room.users.size);
+    ensureHost(room);   // #4: переизбираем, даже если ушёл не хост
   });
 });
 
@@ -491,9 +604,6 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🎵 Server running on http://0.0.0.0:${PORT}`);
-  console.log(`🔑 YM Token: ${YM_TOKEN ? 'SET' : 'NOT SET'}`);
-
-  // Проверяем токен при старте
   if (YM_TOKEN && YM_TOKEN !== 'YOUR_TOKEN_HERE') {
     ymRequest('/account/status')
       .then(data => {
@@ -502,6 +612,6 @@ server.listen(PORT, '0.0.0.0', () => {
       })
       .catch(e => console.log(`❌ Token validation failed: ${e.message}`));
   } else {
-    console.log('⚠️  No YM_TOKEN set - only 30sec previews will be available');
+    console.log('⚠️  No YM_TOKEN set');
   }
 });
