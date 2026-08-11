@@ -134,10 +134,6 @@ func (r *Room) run() {
 // Playback control (play/pause/seek/select/ended) and position reports are
 // only honored when they come from the room leader — every other client is a
 // follower that merely mirrors the leader's clock.
-// prepareDelayMs is the delay before playback starts after a track change.
-// This gives all clients time to buffer the audio before synchronized playback begins.
-const prepareDelayMs = 2000
-
 func (r *Room) handleMessage(in inbound) {
 	switch in.msg.Type {
 	case "play":
@@ -192,9 +188,7 @@ func (r *Room) handleMessage(in inbound) {
 		r.state.TrackIndex = p.TrackIndex
 		r.state.Position = 0
 		r.state.Playing = true
-		// Set UpdatedAt to a future time so all clients have time to buffer
-		// before synchronized playback begins.
-		r.state.UpdatedAt = time.Now().UnixMilli() + prepareDelayMs
+		r.state.UpdatedAt = time.Now().UnixMilli()
 		r.broadcastState()
 
 	case "add":
@@ -216,9 +210,7 @@ func (r *Room) handleMessage(in inbound) {
 			r.state.TrackIndex = len(r.playlist) - 1
 			r.state.Position = 0
 			r.state.Playing = true
-			// Set UpdatedAt to a future time so all clients have time to buffer
-			// before synchronized playback begins.
-			r.state.UpdatedAt = time.Now().UnixMilli() + prepareDelayMs
+			r.state.UpdatedAt = time.Now().UnixMilli()
 			r.broadcastState()
 		}
 
@@ -240,9 +232,7 @@ func (r *Room) handleMessage(in inbound) {
 		r.state.TrackIndex = next
 		r.state.Position = 0
 		r.state.Playing = true
-		// Set UpdatedAt to a future time so all clients have time to buffer
-		// before synchronized playback begins.
-		r.state.UpdatedAt = time.Now().UnixMilli() + prepareDelayMs
+		r.state.UpdatedAt = time.Now().UnixMilli()
 		r.broadcastState()
 
 	case "sync":

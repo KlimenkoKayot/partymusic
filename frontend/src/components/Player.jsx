@@ -11,7 +11,6 @@ export default function Player({
   audioRef,
   track,
   playing,
-  preparing,
   isLeader,
   applyingRemote,
   onPlay,
@@ -73,9 +72,7 @@ export default function Player({
         <div className="track-meta">
           <div className="track-title">{track ? track.title : 'No track selected'}</div>
           <div className="track-sub">
-            {preparing
-              ? '⏳ Preparing synchronized playback...'
-              : track
+            {track
               ? track.artist
                 ? `${track.artist} · ${playing ? 'Playing' : 'Paused'}`
                 : playing

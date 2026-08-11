@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SyncMusic</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+  <div class="app">
+    <!-- Landing -->
+    <div id="landing-screen" class="screen active">
+      <div class="landing-content">
+        <div class="logo">
+          <i class="fas fa-music"></i>
+          <h1>SyncMusic</h1>
+        </div>
+        <p class="tagline">Слушайте музыку вместе с друзьями</p>
+
+        <div class="landing-actions">
+          <button id="create-room-btn" class="btn btn-primary btn-large">
+            <i class="fas fa-plus"></i> Создать комнату
+          </button>
+          <div class="divider"><span>или</span></div>
+          <div class="join-room-form">
+            <input type="text" id="room-code-input" placeholder="Код комнаты" maxlength="8">
+            <button id="join-room-btn" class="btn btn-secondary">
+              <i class="fas fa-door-open"></i>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Room -->
+    <div id="room-screen" class="screen">
+      <header class="room-header">
+        <div class="room-info">
+          <h2>Комната: <span id="room-id">-</span></h2>
+          <div class="user-count"><i class="fas fa-users"></i> <span id="users-count">0</span></div>
+        </div>
+        <div class="room-actions">
+          <button id="copy-link-btn" class="btn btn-icon" title="Копировать ссылку"><i class="fas fa-link"></i></button>
+          <button id="sync-btn" class="btn btn-icon" title="Синхронизировать"><i class="fas fa-sync-alt"></i></button>
+          <button id="leave-room-btn" class="btn btn-icon btn-danger" title="Выйти"><i class="fas fa-sign-out-alt"></i></button>
+        </div>
+      </header>
+
+      <main class="room-content">
+        <!-- Add tracks -->
+        <section class="add-tracks-section">
+          <h3><i class="fas fa-plus-circle"></i> Добавить музыку</h3>
+          <div class="tabs">
+            <button class="tab active" data-tab="link">Ссылка</button>
+            <button class="tab" data-tab="search">Поиск</button>
+          </div>
+          <div class="tab-content active" id="tab-link">
+            <textarea id="yandex-links" placeholder="Вставьте ссылку Яндекс.Музыки..."></textarea>
+            <div class="add-tracks-actions">
+              <button id="add-tracks-btn" class="btn btn-primary" title="Добавить треки из ссылок Яндекс.Музыки"><i class="fas fa-plus"></i> Добавить</button>
+              <button id="add-demo-btn" class="btn btn-secondary" title="Добавить демо-треки для тестирования"><i class="fas fa-music"></i> Демо</button>
+            </div>
+          </div>
+          <div class="tab-content" id="tab-search">
+            <div class="search-form">
+              <input type="text" id="search-input" placeholder="Поиск...">
+              <button id="search-btn" class="btn btn-primary" title="Искать треки на Яндекс.Музыке"><i class="fas fa-search"></i></button>
+            </div>
+            <div id="search-results" class="search-results"></div>
+          </div>
+        </section>
+
+        <!-- Player -->
+        <section class="player-section">
+          <div class="now-playing">
+            <div class="track-cover">
+              <img id="track-cover" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200' viewBox='0 0 200 200'%3E%3Crect fill='%231e1e3a' width='200' height='200'/%3E%3Ctext x='100' y='110' text-anchor='middle' fill='%23ff5500' font-size='60' font-family='sans-serif'%3E♪%3C/text%3E%3C/svg%3E" alt="">
+              <div class="cover-overlay" id="cover-overlay"><i class="fas fa-play"></i></div>
+            </div>
+            <div class="track-info">
+              <h2 id="track-title">Выберите трек</h2>
+              <p id="track-artist">—</p>
+            </div>
+          </div>
+          <div class="progress-section">
+            <span id="current-time">0:00</span>
+            <div class="progress-bar" id="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+            <span id="duration">0:00</span>
+          </div>
+          <div class="controls">
+            <button id="shuffle-btn" class="btn btn-control" title="Случайный порядок воспроизведения"><i class="fas fa-random"></i></button>
+            <button id="prev-btn" class="btn btn-control" title="Предыдущий трек"><i class="fas fa-step-backward"></i></button>
+            <button id="play-btn" class="btn btn-control btn-play" title="Воспроизвести/Пауза"><i class="fas fa-play"></i></button>
+            <button id="next-btn" class="btn btn-control" title="Следующий трек"><i class="fas fa-step-forward"></i></button>
+            <button id="repeat-btn" class="btn btn-control" title="Повторять текущий трек"><i class="fas fa-redo"></i></button>
+          </div>
+          <div class="volume-control">
+            <button id="mute-btn" class="btn btn-icon" title="Выключить/Включить звук"><i class="fas fa-volume-up"></i></button>
+            <input type="range" id="volume-slider" min="0" max="100" value="70">
+          </div>
+        </section>
+
+        <!-- Playlist -->
+        <section class="playlist-section">
+          <div class="playlist-header">
+            <h3><i class="fas fa-list"></i> Плейлист (<span id="playlist-count">0</span>)</h3>
+            <button id="clear-playlist-btn" class="btn btn-small btn-danger" title="Очистить весь плейлист"><i class="fas fa-trash"></i></button>
+          </div>
+          <div class="playlist" id="playlist">
+            <div class="playlist-empty"><i class="fas fa-music"></i><p>Плейлист пуст</p></div>
+          </div>
+        </section>
+      </main>
+
+      <audio id="audio-player" preload="auto"></audio>
+    </div>
+  </div>
+  <div id="notifications" class="notifications"></div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
