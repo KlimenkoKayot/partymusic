@@ -1,0 +1,29 @@
+[Unit]
+Description=PartyMusic - Synchronized Music Player
+Documentation=https://music.yandex.ru
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/partymusic
+ExecStart=/usr/bin/node /opt/partymusic/server.js
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=partymusic
+
+# Environment
+EnvironmentFile=/opt/partymusic/.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/partymusic
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
